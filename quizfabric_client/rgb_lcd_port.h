@@ -43,7 +43,7 @@
 #define EXAMPLE_RGB_BIT_PER_PIXEL       (16)   ///< RGB interface color depth
 #define EXAMPLE_RGB_DATA_WIDTH          (16)   ///< Data width for RGB interface
 #define EXAMPLE_LCD_RGB_BUFFER_NUMS     (1)    ///< Number of frame buffers for double buffering
-#define EXAMPLE_RGB_BOUNCE_BUFFER_SIZE  (EXAMPLE_LCD_H_RES * 30) ///< Size of bounce buffer for RGB data
+#define EXAMPLE_RGB_BOUNCE_BUFFER_SIZE  (EXAMPLE_LCD_H_RES * 45) ///< Size of bounce buffer for RGB data
 
 /**
  * @brief GPIO Pins for RGB LCD Signals

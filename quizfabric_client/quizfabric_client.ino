@@ -59,14 +59,28 @@ uint16_t ansColor(int i) {
 }
 
 // ------------------------------------------------------------------ drawing
+// Fill one row segment with 32-bit stores (2 pixels at a time) - about
+// half the time of the per-pixel loop. Every millisecond the main loop
+// spends drawing starves the LCD bounce ISR on the same core and shows
+// as screen glitching.
+static inline void fillRow(int x, int y, int w, uint16_t c) {
+    uint32_t cc = c | ((uint32_t)c << 16);
+    uint16_t *row = &fb[y * FB_W];
+    int xx = x;
+    if (xx & 1) row[xx++] = c;
+    uint32_t *p32 = (uint32_t *)(row + xx);
+    int n = (x + w - xx) >> 1;
+    while (n-- > 0) *p32++ = cc;
+    if ((x + w - xx) & 1) row[x + w - 1] = c;
+}
+
 void fillRect(int x, int y, int w, int h, uint16_t c) {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > FB_W) w = FB_W - x;
     if (y + h > FB_H) h = FB_H - y;
     if (w <= 0 || h <= 0) return;
-    for (int yy = y; yy < y + h; yy++)
-        for (int xx = x; xx < x + w; xx++) fb[yy * FB_W + xx] = c;
+    for (int yy = y; yy < y + h; yy++) fillRow(x, yy, w, c);
 }
 
 uint16_t lerpColor(uint16_t a, uint16_t b, float t) {
@@ -85,10 +99,8 @@ void drawBackground(void) {
     uint16_t topB = RGB(255, 106, 173), botB = RGB(70, 30, 150);
     uint16_t top = lerpColor(topA, topB, s);
     uint16_t bot = lerpColor(botA, botB, s);
-    for (int y = 0; y < FB_H; y++) {
-        uint16_t c = lerpColor(top, bot, (float)y / FB_H);
-        for (int x = 0; x < FB_W; x++) fb[y * FB_W + x] = c;
-    }
+    for (int y = 0; y < FB_H; y++)
+        fillRow(0, y, FB_W, lerpColor(top, bot, (float)y / FB_H));
 }
 
 // The same gradient, but only inside one rectangle. Used for partial
@@ -104,10 +116,8 @@ void drawBackgroundRect(int x, int y, int w, int h) {
     uint16_t topB = RGB(255, 106, 173), botB = RGB(70, 30, 150);
     uint16_t top = lerpColor(topA, topB, s);
     uint16_t bot = lerpColor(botA, botB, s);
-    for (int yy = y; yy < y + h; yy++) {
-        uint16_t c = lerpColor(top, bot, (float)yy / FB_H);
-        for (int xx = x; xx < x + w; xx++) fb[yy * FB_W + xx] = c;
-    }
+    for (int yy = y; yy < y + h; yy++)
+        fillRow(x, yy, w, lerpColor(top, bot, (float)yy / FB_H));
 }
 
 void drawRect(int x, int y, int w, int h, uint16_t c) {
@@ -463,6 +473,9 @@ static volatile uint32_t fetchJobId = 0;
 static String fetchBody;
 static int fetchStatus = -1;
 static volatile uint32_t fetchDoneId = 0;
+static uint16_t *fetchSpr = nullptr;
+static int fetchSprW = 0, fetchSprH = 0;
+static bool fetchSprGif = false;
 
 void fetchTaskFn(void *arg) {
     for (;;) {
@@ -472,11 +485,24 @@ void fetchTaskFn(void *arg) {
         uint32_t jid = fetchJobId;
         xSemaphoreGive(fetchLock);
         HttpResp r = http_req("GET", p);
+        // Decode .565 payloads HERE on core 0: the per-pixel PERM loop
+        // starves the LCD bounce-copy ISR when it runs on the UI core
+        // (core 1) and that is what made the screen glitch during and
+        // after image downloads.
+        uint16_t *spr = nullptr; int sw = 0, sh = 0; bool isGif = false;
+        if (r.status == 200 && r.body.length() > 6 && p.endsWith(".565")) {
+            if (!decode565((const uint8_t *)r.body.c_str(), r.body.length(), &spr, &sw, &sh))
+                if ((uint8_t)r.body[4] >= 2) isGif = true;
+            r.body = "";   // free the raw body immediately
+        }
         xSemaphoreTake(fetchLock, portMAX_DELAY);
         if (jid == fetchJobId) {   // not superseded by a newer job
             fetchBody = r.body;
             fetchStatus = r.status;
             fetchDoneId = jid;
+            fetchSpr = spr; fetchSprW = sw; fetchSprH = sh; fetchSprGif = isGif;
+        } else if (spr) {
+            free(spr);   // stale job - discard its sprite
         }
         xSemaphoreGive(fetchLock);
     }
@@ -502,6 +528,19 @@ bool fetchTake(uint32_t jobId, String &body, int *status) {
     xSemaphoreTake(fetchLock, portMAX_DELAY);
     bool ok = jobId != 0 && fetchDoneId >= jobId;
     if (ok) { body = fetchBody; *status = fetchStatus; }
+    xSemaphoreGive(fetchLock);
+    return ok;
+}
+
+// Like fetchTake but hands over the decoded sprite (the caller owns it).
+bool fetchTakeSprite(uint32_t jobId, int *status, uint16_t **spr, int *w, int *h, bool *isGif) {
+    xSemaphoreTake(fetchLock, portMAX_DELAY);
+    bool ok = jobId != 0 && fetchDoneId >= jobId;
+    if (ok) {
+        *status = fetchStatus;
+        *spr = fetchSpr; *w = fetchSprW; *h = fetchSprH; *isGif = fetchSprGif;
+        fetchSpr = nullptr;   // caller owns it now
+    }
     xSemaphoreGive(fetchLock);
     return ok;
 }
@@ -628,16 +667,13 @@ static uint32_t thumbJobId = 0;
 int pumpThumb(void) {
     if (thumbJobId) {
         int status = -1;
-        String body;
-        if (!fetchTake(thumbJobId, body, &status)) return -1;   // still loading
+        uint16_t *s = nullptr; int w = 0, h = 0; bool gif = false;
+        if (!fetchTakeSprite(thumbJobId, &status, &s, &w, &h, &gif)) return -1;   // still loading
         thumbJobId = 0;
         int slot = thumbFetchSlot;
-        if (status == 200) {
-            uint16_t *s = nullptr; int w = 0, h = 0;
-            if (decode565((const uint8_t *)body.c_str(), body.length(), &s, &w, &h)) {
-                thumbSpr[slot] = s; thumbW[slot] = w; thumbH[slot] = h;
-                return slot;
-            }
+        if (s) {
+            thumbSpr[slot] = s; thumbW[slot] = w; thumbH[slot] = h;
+            return slot;
         }
         return -1;
     }
@@ -855,17 +891,11 @@ void freeQuestionImage(void) {
 void pollQuestionImage(void) {
     if (!qImgJobId) return;
     int status = -1;
-    String body;
-    if (!fetchTake(qImgJobId, body, &status)) return;   // still loading
+    uint16_t *s = nullptr; int w = 0, h = 0; bool gif = false;
+    if (!fetchTakeSprite(qImgJobId, &status, &s, &w, &h, &gif)) return;   // still loading
     qImgJobId = 0;
-    if (status == 200 && body.length() > 6) {
-        uint16_t *s = nullptr; int w = 0, h = 0;
-        if (decode565((const uint8_t *)body.c_str(), body.length(), &s, &w, &h)) {
-            qImgSpr = s; qImgW = w; qImgH = h;
-        } else if ((uint8_t)body[4] >= 2) {
-            qImgGif = true;   // animated - skipped
-        }
-    }
+    if (s) { qImgSpr = s; qImgW = w; qImgH = h; }
+    else if (gif) qImgGif = true;   // animated - skipped
     playNeedsFull = true;
 }
 
@@ -1242,17 +1272,14 @@ static uint32_t sCovJobId = 0;
 int pumpStealCovers(void) {
     if (sCovJobId) {
         int status = -1;
-        String body;
-        if (!fetchTake(sCovJobId, body, &status)) return -1;   // still loading
+        uint16_t *s = nullptr; int w = 0, h = 0; bool gif = false;
+        if (!fetchTakeSprite(sCovJobId, &status, &s, &w, &h, &gif)) return -1;   // still loading
         sCovJobId = 0;
         int idx = sCovIdx;
         sCovIdx++;
-        if (status == 200) {
-            uint16_t *s = nullptr; int w = 0, h = 0;
-            if (decode565((const uint8_t *)body.c_str(), body.length(), &s, &w, &h)) {
-                sCovSpr[idx] = s; sCovW[idx] = w; sCovH[idx] = h;
-                return idx;
-            }
+        if (s) {
+            sCovSpr[idx] = s; sCovW[idx] = w; sCovH[idx] = h;
+            return idx;
         }
         return -1;
     }
