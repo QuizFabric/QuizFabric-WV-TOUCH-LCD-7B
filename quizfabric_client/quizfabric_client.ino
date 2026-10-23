@@ -1,16 +1,12 @@
 /*
  * QuizFabric client for the Waveshare ESP32-S3-Touch-LCD-7B.
  *
- * Inspired by the 3DS port (E:/3DSTHINGY). Features:
- *  - Solo play: quiz list with banners, questions (mc / type-in / slider /
- *    puzzle), scoring identical to the 3DS client (max(0, 1000 - secs*50))
- *  - Steal from Kahoot: search, cover previews, one-tap steal
- *  - Server address configurable on-device
+ * UI styled after the 3DS client's bottom screen: pink/purple animated
+ * gradient, glass panels, coloured answer tiles (same palette as the 3DS).
+ * The 3DS top-screen content (question + image) is fitted into the upper
+ * part of this single screen.
  *
- * GIFs / animated question images are NOT loaded (the ESP32 is too slow
- * for them) - they show a "GIF skipped" placeholder instead.
- *
- * Talks plain HTTP to the QuizFabric server (default: the Pi on the LAN).
+ * GIFs / animated question images are NOT loaded (too slow on the ESP32).
  */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -26,38 +22,71 @@ const char *WIFI_SSID = "VM6842809";
 const char *WIFI_PASS = "h2hFnrycpprn";
 
 String SERVER_HOST = "192.168.50.65";
-int SERVER_PORT = 5710;   // plain HTTP port on the Pi
+int SERVER_PORT = 5710;
 
 // ------------------------------------------------------------------ display
 static const int FB_W = EXAMPLE_LCD_H_RES;   // 1024
 static const int FB_H = EXAMPLE_LCD_V_RES;   // 600
 uint16_t *fb = nullptr;
 
-// ------------------------------------------------------------------ drawing
 #define RGB(r, g, b) ((uint16_t)((((r) * 31 + 127) / 255) << 11) | \
                        ((((g) * 63 + 127) / 255) << 5) | \
                        (((b) * 31 + 127) / 255))
 
-const uint16_t C_BG     = RGB(24, 16, 40);
-const uint16_t C_PANEL  = RGB(46, 30, 70);
-const uint16_t C_BTN    = RGB(79, 70, 229);
-const uint16_t C_BTN2   = RGB(34, 197, 94);
-const uint16_t C_RED    = RGB(220, 38, 38);
-const uint16_t C_TEXT   = RGB(255, 255, 255);
-const uint16_t C_DIM    = RGB(160, 160, 175);
-const uint16_t C_GOLD   = RGB(250, 204, 21);
-const uint16_t C_CYAN   = RGB(34, 211, 238);
-const uint16_t C_SEL    = RGB(250, 204, 21);
-const uint16_t C_GOOD   = RGB(74, 222, 128);
-const uint16_t C_BAD    = RGB(248, 113, 113);
+// 3DS palette
+const uint16_t C_INK     = RGB(46, 16, 70);
+const uint16_t C_GLASS   = RGB(141, 105, 183);   // white 18% over purple
+const uint16_t C_GLASS_HI= RGB(167, 135, 205);   // white 36% over purple
+const uint16_t C_GOLD    = RGB(255, 208, 92);
+const uint16_t C_GOOD    = RGB(58, 214, 160);
+const uint16_t C_BAD     = RGB(255, 92, 116);
+const uint16_t C_TEXT    = RGB(255, 255, 255);
+const uint16_t C_DIM     = RGB(235, 235, 245);
+const uint16_t C_FAINT   = RGB(200, 185, 215);
 
+uint16_t ansColor(int i) {
+    switch (i & 7) {
+        case 0: return RGB(255, 79, 129);
+        case 1: return RGB(124, 77, 255);
+        case 2: return RGB(255, 159, 69);
+        case 3: return RGB(56, 224, 200);
+        case 4: return RGB(255, 110, 199);
+        case 5: return RGB(104, 132, 255);
+        case 6: return RGB(196, 116, 255);
+        default: return RGB(90, 214, 140);
+    }
+}
+
+// ------------------------------------------------------------------ drawing
 void fillRect(int x, int y, int w, int h, uint16_t c) {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > FB_W) w = FB_W - x;
     if (y + h > FB_H) h = FB_H - y;
-    for (int yy = y; yy < y + h; yy++) {
+    if (w <= 0 || h <= 0) return;
+    for (int yy = y; yy < y + h; yy++)
         for (int xx = x; xx < x + w; xx++) fb[yy * FB_W + xx] = c;
+}
+
+uint16_t lerpColor(uint16_t a, uint16_t b, float t) {
+    int ar = (a >> 11) & 31, ag = (a >> 5) & 63, ab = a & 31;
+    int br = (b >> 11) & 31, bg = (b >> 5) & 63, bb = b & 31;
+    int r = ar + (br - ar) * t;
+    int g = ag + (bg - ag) * t;
+    int bl = ab + (bb - ab) * t;
+    return (r << 11) | (g << 5) | bl;
+}
+
+// Animated pink/purple vertical gradient, like the 3DS background.
+void drawBackground(void) {
+    float s = sinf(millis() * 0.00035f) * 0.5f + 0.5f;
+    uint16_t topA = RGB(255, 138, 205), botA = RGB(96, 42, 176);
+    uint16_t topB = RGB(255, 106, 173), botB = RGB(70, 30, 150);
+    uint16_t top = lerpColor(topA, topB, s);
+    uint16_t bot = lerpColor(botA, botB, s);
+    for (int y = 0; y < FB_H; y++) {
+        uint16_t c = lerpColor(top, bot, (float)y / FB_H);
+        for (int x = 0; x < FB_W; x++) fb[y * FB_W + x] = c;
     }
 }
 
@@ -66,6 +95,18 @@ void drawRect(int x, int y, int w, int h, uint16_t c) {
     fillRect(x, y + h - 1, w, 1, c);
     fillRect(x, y, 1, h, c);
     fillRect(x + w - 1, y, 1, h, c);
+}
+
+// 3DS-style glass panel: fill + slightly brighter top edge.
+void glassPanel(int x, int y, int w, int h, bool hi) {
+    fillRect(x, y, w, h, hi ? C_GLASS_HI : C_GLASS);
+    fillRect(x, y, w, 2, C_GLASS_HI);
+}
+
+// Answer tile: colour + darker bottom edge (3DS look).
+void tile(int x, int y, int w, int h, uint16_t c) {
+    fillRect(x, y, w, h, c);
+    fillRect(x, y + h - 6, w, 6, lerpColor(c, C_INK, 0.35f));
 }
 
 void drawChar(int x, int y, char c, uint16_t color, int scale) {
@@ -86,7 +127,7 @@ void drawChar(int x, int y, char c, uint16_t color, int scale) {
     }
 }
 
-int drawString(int x, int y, const char *s, uint16_t color, int scale) {
+void drawString(int x, int y, const char *s, uint16_t color, int scale) {
     int cx = x;
     while (*s) {
         if (cx + 8 * scale > FB_W) break;
@@ -94,42 +135,75 @@ int drawString(int x, int y, const char *s, uint16_t color, int scale) {
         cx += 8 * scale;
         s++;
     }
-    return cx;
 }
 
-int textWidth(const char *s, int scale) { return strlen(s) * 8 * scale; }
+int textW(const char *s, int scale) { return strlen(s) * 8 * scale; }
 
 void drawCentered(int y, const char *s, uint16_t color, int scale) {
-    drawString((FB_W - textWidth(s, scale)) / 2, y, s, color, scale);
+    drawString((FB_W - textW(s, scale)) / 2, y, s, color, scale);
 }
 
-void blit() { wavesahre_rgb_lcd_display((uint8_t *)fb); }
+// Shadowed centered text like the 3DS.
+void drawCenteredShadow(int y, const char *s, uint16_t color, int scale) {
+    drawCentered(y + scale, s, C_INK, scale);
+    drawCentered(y, s, color, scale);
+}
+
+// Wraps text into lines (simple word wrap). Returns line count.
+int wrapText(const char *s, int maxw, int scale, String *lines, int maxLines) {
+    int n = 0;
+    String cur = "";
+    String word = "";
+    for (const char *p = s; ; p++) {
+        if (*p && *p != ' ' && *p != '\n') { word += *p; continue; }
+        if (cur.length() && textW((cur + " " + word).c_str(), scale) > maxw) {
+            if (n < maxLines) lines[n++] = cur;
+            cur = word;
+        } else {
+            cur = cur.length() ? cur + " " + word : word;
+        }
+        word = "";
+        if (*p == '\n') {
+            if (n < maxLines) lines[n++] = cur;
+            cur = "";
+        }
+        if (!*p) break;
+    }
+    if (cur.length() && n < maxLines) lines[n++] = cur;
+    return n;
+}
+
+void blit(void) { wavesahre_rgb_lcd_display((uint8_t *)fb); }
+
+// Back button (top-left, 3DS-style tile).
+bool backHit(int x, int y, int w, int h) {
+    return x >= 12 && x < 12 + w && y >= 12 && y < 12 + h;
+}
+void drawBack(void) {
+    tile(12, 12, 120, 44, C_INK);
+    drawCentered(24, "Back", C_TEXT, 2);
+}
 
 // ------------------------------------------------------------------ touch
 touch_gt911_point_t tp;
 bool tpActive = false;
-int tpX = 0, tpY = 0, tpStartX = 0, tpStartY = 0;
+int tpX = 0, tpY = 0;
 unsigned long tpDownMs = 0;
 bool tapConsumed = false;
 
 void touch_step(void) {
     tp = touch_gt911_read_point(1);
     bool active = tp.cnt > 0;
-    if (active && !tpActive) {          // press
+    if (active && !tpActive) {
         tpActive = true;
-        tpStartX = tp.x[0];
-        tpStartY = tp.y[0];
         tpDownMs = millis();
         tapConsumed = false;
     }
     if (active) { tpX = tp.x[0]; tpY = tp.y[0]; }
-    if (!active && tpActive) {          // release
-        tpActive = false;
-    }
+    if (!active && tpActive) tpActive = false;
 }
 
 bool tapIn(int x, int y, int w, int h) {
-    // True on the release edge inside the rect, once.
     if (tapConsumed) return false;
     if (!tpActive && tpX >= x && tpX < x + w && tpY >= y && tpY < y + h) {
         unsigned long held = millis() - tpDownMs;
@@ -141,22 +215,15 @@ bool tapIn(int x, int y, int w, int h) {
 
 void touch_wait_release(void) { while (touch_gt911_read_point(1).cnt > 0) delay(5); }
 
-// ------------------------------------------------------------------ 565 decode
+// ------------------------------------------------------------------ .565 decode
 static const uint8_t PERM[64] = {
     0, 1, 8, 9, 16, 17, 10, 2, 3, 11, 18, 19, 24, 25, 20, 12,
     4, 5, 14, 13, 22, 23, 28, 21, 6, 7, 15, 26, 27, 30, 31, 29,
     32, 33, 40, 41, 48, 49, 42, 34, 35, 43, 50, 51, 56, 57, 52, 44,
     36, 37, 46, 45, 54, 55, 60, 53, 38, 39, 47, 58, 59, 62, 63, 61
 };
+static int pow2up(int v) { int p = 8; while (p < v) p <<= 1; return p; }
 
-static int pow2up(int v) {
-    int p = 8;
-    while (p < v) p <<= 1;
-    return p;
-}
-
-// Decodes a static .565 into a RGB565 sprite. Returns false for animated
-// (GIF) payloads - the ESP32 skips those.
 bool decode565(const uint8_t *data, size_t len, uint16_t **spr, int *w, int *h) {
     if (len < 6) return false;
     int iw = data[0] | (data[1] << 8);
@@ -165,17 +232,14 @@ bool decode565(const uint8_t *data, size_t len, uint16_t **spr, int *w, int *h) 
     int pw = pow2up(iw), ph = pow2up(ih);
     size_t fbSize = (size_t)pw * ph * 4;
     if (len == 4 + fbSize) {
-        // static
     } else if (len >= 6) {
         int n = data[4];
-        if (n >= 2 && len == 6 + (size_t)n * fbSize) return false;   // animated: skip
+        if (n >= 2 && len == 6 + (size_t)n * fbSize) return false;
         return false;
-    } else {
-        return false;
-    }
+    } else return false;
     uint16_t *img = (uint16_t *)heap_caps_malloc((size_t)iw * ih * 2, MALLOC_CAP_SPIRAM);
     if (!img) return false;
-    for (int by = 0; by < (ph >> 3); by++) {
+    for (int by = 0; by < (ph >> 3); by++)
         for (int bx = 0; bx < (pw >> 3); bx++) {
             size_t base = ((size_t)by * (pw >> 3) + bx) * 64;
             for (int j = 0; j < 64; j++) {
@@ -185,17 +249,10 @@ bool decode565(const uint8_t *data, size_t len, uint16_t **spr, int *w, int *h) 
                 size_t off = (base + j) * 4;
                 uint8_t a = data[4 + off], b = data[4 + off + 1], g = data[4 + off + 2], r = data[4 + off + 3];
                 if (sx < iw && sy < ih) {
-                    // composite over the bg colour (fillRect handles blending
-                    // poorly; simple alpha blend with a dark panel)
-                    int bgR = 46, bgG = 30, bgB = 70;
-                    r = (r * a + bgR * (255 - a)) / 255;
-                    g = (g * a + bgG * (255 - a)) / 255;
-                    b = (b * a + bgB * (255 - a)) / 255;
                     img[sy * iw + sx] = RGB(r, g, b);
                 }
             }
         }
-    }
     *spr = img; *w = iw; *h = ih;
     return true;
 }
@@ -217,7 +274,7 @@ HttpResp http_req(const char *method, const String &path, const String &formData
     HttpResp r = { -1, "" };
     WiFiClient c;
     if (!c.connect(SERVER_HOST.c_str(), SERVER_PORT)) return r;
-    c.setTimeout(15000);
+    c.setTimeout(10000);
     c.print(method);
     c.print(' ');
     c.print(path);
@@ -233,14 +290,25 @@ HttpResp http_req(const char *method, const String &path, const String &formData
     } else {
         c.print("\r\n");
     }
-    // skip headers
-    String line = "";
-    while (c.connected()) {
+    // headers
+    unsigned long deadline = millis() + 10000;
+    while (c.connected() && millis() < deadline) {
+        if (!c.available()) { delay(1); continue; }
         String l = c.readStringUntil('\n');
         if (l.startsWith("HTTP/")) r.status = l.substring(9, 12).toInt();
-        if (l == "\r" || l == "") break;
+        if (l == "\r" || l.length() == 1) break;   // blank line = end of headers
     }
-    while (c.available()) r.body += (char)c.read();
+    // body: read until the connection closes (or timeout)
+    deadline = millis() + 15000;
+    while (millis() < deadline) {
+        if (c.available()) {
+            while (c.available()) r.body += (char)c.read();
+        } else if (!c.connected()) {
+            break;
+        } else {
+            delay(1);
+        }
+    }
     c.stop();
     return r;
 }
@@ -259,72 +327,59 @@ String urlEncode(const char *s) {
     return out;
 }
 
-// Fetches a .565 image over HTTP and decodes it into a sprite.
-// Returns false for GIFs (skipped) or any failure.
 bool fetchImage565(const String &path, uint16_t **spr, int *w, int *h, bool *isGif) {
     HttpResp r = http_req("GET", path);
     *isGif = false;
     if (r.status != 200 || r.body.length() < 6) return false;
     const uint8_t *d = (const uint8_t *)r.body.c_str();
-    int n = d[4];
-    if (n >= 2) { *isGif = true; return false; }   // animated: never load
+    if (d[4] >= 2) { *isGif = true; return false; }
     return decode565(d, r.body.length(), spr, w, h);
 }
 
 // ------------------------------------------------------------------ keyboard
 String keyboard(const char *hint, const char *initial) {
-    static const char *rows[3] = {
-        "qwertyuiop",
-        "asdfghjkl",
-        "zxcvbnm1234567890"
-    };
+    static const char *rows[3] = { "qwertyuiop", "asdfghjkl", "zxcvbnm1234567890" };
     String out = initial ? initial : "";
     bool shift = false;
     while (true) {
-        fillRect(0, 0, FB_W, FB_H, C_BG);
-        fillRect(40, 30, FB_W - 80, 90, C_PANEL);
-        drawRect(40, 30, FB_W - 80, 90, C_DIM);
-        drawCentered(40, hint, C_DIM, 1);
-        drawCentered(70, out.c_str(), C_TEXT, 2);
-        // keys
-        int baseY = 150;
+        drawBackground();
+        glassPanel(20, 16, FB_W - 40, 96, false);
+        drawCentered(30, hint, C_FAINT, 1);
+        drawCentered(62, out.c_str(), C_TEXT, 2);
+
+        int baseY = 132;
         for (int r = 0; r < 3; r++) {
             const char *row = rows[r];
             int n = strlen(row);
-            int kw = (FB_W - 80) / (n + 1);
+            int kw = (FB_W - 60) / n;
             for (int i = 0; i < n; i++) {
-                int kx = 40 + (i + 1) * (kw + 10) / 2;
-                int x = 40 + (i + 1) * 10 + i * kw;
+                int x = 30 + i * kw;
                 char ch = row[i];
                 if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
-                fillRect(x, baseY + r * 70, kw, 60, C_BTN);
+                tile(x, baseY + r * 72, kw - 8, 64, ansColor(r));
                 char b[2] = { ch, 0 };
-                drawString(x + kw / 2 - 4, baseY + r * 70 + 22, b, C_TEXT, 2);
+                drawCentered(baseY + r * 72 + 20, b, C_TEXT, 2);
             }
         }
-        // controls
-        fillRect(40, baseY + 3 * 70 + 10, 240, 60, C_BTN2);
-        drawCentered(baseY + 3 * 70 + 32, "SPACE", C_TEXT, 2);
-        fillRect(300, baseY + 3 * 70 + 10, 240, 60, C_CYAN);
-        drawCentered(baseY + 3 * 70 + 32, shift ? "ABC" : "SHIFT", C_BG, 2);
-        fillRect(560, baseY + 3 * 70 + 10, 200, 60, C_RED);
-        drawCentered(baseY + 3 * 70 + 32, "DEL", C_TEXT, 2);
-        fillRect(780, baseY + 3 * 70 + 10, 200, 60, C_GOOD);
-        drawCentered(baseY + 3 * 70 + 32, "DONE", C_BG, 2);
+        int cy = baseY + 3 * 72 + 12;
+        tile(30, cy, 230, 64, C_GLASS);       drawCentered(cy + 20, "SPACE", C_TEXT, 2);
+        tile(280, cy, 200, 64, C_GLASS_HI);    drawCentered(cy + 20, shift ? "ABC" : "SHIFT", C_INK, 2);
+        tile(500, cy, 200, 64, C_BAD);         drawCentered(cy + 20, "DEL", C_TEXT, 2);
+        tile(720, cy, 274, 64, C_GOOD);        drawCentered(cy + 20, "DONE", C_INK, 2);
         blit();
 
         touch_step();
-        if (tapIn(40, baseY + 3 * 70 + 10, 240, 60)) { out += ' '; }
-        if (tapIn(300, baseY + 3 * 70 + 10, 240, 60)) { shift = !shift; }
-        if (tapIn(560, baseY + 3 * 70 + 10, 200, 60)) { if (out.length()) out.remove(out.length() - 1); }
-        if (tapIn(780, baseY + 3 * 70 + 10, 200, 60)) { touch_wait_release(); return out; }
+        if (tapIn(30, cy, 230, 64)) out += ' ';
+        if (tapIn(280, cy, 200, 64)) shift = !shift;
+        if (tapIn(500, cy, 200, 64)) { if (out.length()) out.remove(out.length() - 1); }
+        if (tapIn(720, cy, 274, 64)) { touch_wait_release(); return out; }
         for (int r = 0; r < 3; r++) {
             const char *row = rows[r];
             int n = strlen(row);
-            int kw = (FB_W - 80) / (n + 1);
+            int kw = (FB_W - 60) / n;
             for (int i = 0; i < n; i++) {
-                int x = 40 + (i + 1) * 10 + i * kw;
-                if (tapIn(x, baseY + r * 70, kw, 60)) {
+                int x = 30 + i * kw;
+                if (tapIn(x, baseY + r * 72, kw - 8, 64)) {
                     char ch = row[i];
                     if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
                     if (out.length() < 120) out += ch;
@@ -348,26 +403,23 @@ int nQuizzes = 0;
 int listScroll = 0;
 int listSel = -1;
 #define LIST_ROWS 8
-
-// thumbnails for the visible list rows
-#define MAX_THUMBS LIST_ROWS
-uint16_t *thumbSpr[MAX_THUMBS] = { nullptr };
-int thumbW[MAX_THUMBS], thumbH[MAX_THUMBS];
-int thumbFor[MAX_THUMBS];
+uint16_t *thumbSpr[LIST_ROWS] = { nullptr };
+int thumbW[LIST_ROWS], thumbH[LIST_ROWS];
+int thumbFor[LIST_ROWS];
 
 void freeThumbs(void) {
-    for (int i = 0; i < MAX_THUMBS; i++) {
+    for (int i = 0; i < LIST_ROWS; i++) {
         if (thumbSpr[i]) { free(thumbSpr[i]); thumbSpr[i] = nullptr; }
         thumbFor[i] = -1;
     }
 }
 
-void queueThumb(int slot, int quizIdx) {
-    if (thumbSpr[slot] || thumbFor[slot] == quizIdx) return;
-    thumbFor[slot] = quizIdx;
-    String enc = urlEncode(quizNames[quizIdx].c_str());
+void queueThumb(int slot, int qi) {
+    if (thumbSpr[slot] || thumbFor[slot] == qi) return;
+    thumbFor[slot] = qi;
     bool gif = false;
     uint16_t *s = nullptr; int w = 0, h = 0;
+    String enc = urlEncode(quizNames[qi].c_str());
     if (fetchImage565("/api/quizbanner/" + enc, &s, &w, &h, &gif) && s) {
         thumbSpr[slot] = s; thumbW[slot] = w; thumbH[slot] = h;
     }
@@ -377,7 +429,7 @@ void fetchQuizList(void) {
     nQuizzes = 0;
     freeThumbs();
     HttpResp r = http_req("GET", "/api/quizzes");
-    if (r.status != 200) { statusLine = "Could not load the quiz list"; return; }
+    if (r.status != 200) { statusLine = "Could not load the quiz list (" + String(r.status) + ")"; return; }
     JsonDocument doc;
     if (deserializeJson(doc, r.body)) { statusLine = "Bad quiz list response"; return; }
     JsonArray arr = doc["quizzes"];
@@ -387,71 +439,74 @@ void fetchQuizList(void) {
         quizHasBanner[nQuizzes] = q["banner"].as<bool>();
         nQuizzes++;
     }
-    statusLine = "";
+    statusLine = nQuizzes ? "" : "Server has no quizzes yet";
 }
 
+// ------------------------------------------------------------------ menu
 void drawMenu(void) {
-    fillRect(0, 0, FB_W, FB_H, C_BG);
-    drawCentered(80, "QuizFabric", C_GOLD, 4);
-    drawCentered(150, String("Server: " + SERVER_HOST + ":" + String(SERVER_PORT)).c_str(), C_DIM, 1);
-    fillRect(80, 230, FB_W - 160, 90, C_BTN);
-    drawCentered(265, "Play Solo", C_TEXT, 3);
-    fillRect(80, 350, FB_W - 160, 90, C_BTN2);
-    drawCentered(385, "Steal from Kahoot", C_TEXT, 3);
-    fillRect(80, 470, FB_W - 160, 90, C_PANEL);
-    drawCentered(505, "Server settings", C_TEXT, 2);
-    if (statusLine.length()) {
-        drawCentered(FB_H - 40, statusLine.c_str(), C_BAD, 1);
-    }
+    drawBackground();
+    drawCenteredShadow(70, "QuizFabric", C_GOLD, 4);
+    drawCentered(140, String("Server: " + SERVER_HOST + ":" + String(SERVER_PORT)).c_str(), C_FAINT, 1);
+    tile(80, 220, FB_W - 160, 90, ansColor(0));
+    drawCenteredShadow(252, "Play Solo", C_TEXT, 3);
+    tile(80, 340, FB_W - 160, 90, ansColor(2));
+    drawCenteredShadow(372, "Steal from Kahoot", C_TEXT, 3);
+    glassPanel(80, 460, FB_W - 160, 90, true);
+    drawCentered(496, "Server settings", C_TEXT, 2);
+    if (statusLine.length()) drawCentered(FB_H - 30, statusLine.c_str(), C_BAD, 1);
     blit();
 }
 
 void menuLoop(void) {
-    if (statusLine.length() == 0) statusLine = "";
     drawMenu();
     while (screen == SCR_MENU) {
         touch_step();
-        if (tapIn(80, 230, FB_W - 160, 90)) { screen = SCR_LIST; fetchQuizList(); return; }
-        if (tapIn(80, 350, FB_W - 160, 90)) { screen = SCR_STEAL; return; }
-        if (tapIn(80, 470, FB_W - 160, 90)) { screen = SCR_CONFIG; return; }
+        if (tapIn(80, 220, FB_W - 160, 90)) { screen = SCR_LIST; fetchQuizList(); return; }
+        if (tapIn(80, 340, FB_W - 160, 90)) { screen = SCR_STEAL; return; }
+        if (tapIn(80, 460, FB_W - 160, 90)) { screen = SCR_CONFIG; return; }
         delay(10);
     }
 }
 
 // ------------------------------------------------------------------ list
 void drawList(void) {
-    fillRect(0, 0, FB_W, FB_H, C_BG);
-    drawCentered(16, "Choose a quiz", C_TEXT, 2);
-    drawCentered(52, "Scroll: drag. Tap a quiz to play it.", C_DIM, 1);
+    drawBackground();
+    drawCenteredShadow(14, "Choose a quiz", C_TEXT, 2);
+    drawCentered(50, "Drag to scroll, tap to play", C_FAINT, 1);
     int y = 84;
     for (int i = 0; i < LIST_ROWS; i++) {
         int qi = listScroll + i;
         if (qi >= nQuizzes) break;
         int rowY = y + i * 62;
-        uint16_t rowC = (i % 2) ? C_PANEL : RGB(38, 25, 58);
-        fillRect(16, rowY, FB_W - 32, 56, rowC);
-        int slot = i;
-        if (thumbSpr[slot]) {
-            float scale = 56.0f / thumbH[slot];
-            int dw = thumbW[slot] * scale;
-            if (dw > 96) dw = 96;
-            drawSprite(20, rowY + 4, thumbSpr[slot], thumbW[slot], thumbH[slot]);
+        glassPanel(16, rowY, FB_W - 32, 56, (i % 2) == 0);
+        if (thumbSpr[i]) {
+            float sc = 48.0f / thumbH[i];
+            int dw = thumbW[i] * sc;
+            if (dw > 88) dw = 88;
+            drawSprite(22, rowY + 4, thumbSpr[i], thumbW[i], thumbH[i]);
         } else {
-            fillRect(20, rowY + 4, 48, 48, C_DIM);
-            drawCentered(rowY + 22, "?", C_BG, 2);
+            fillRect(22, rowY + 4, 48, 48, C_INK);
+            drawCentered(rowY + 18, "?", C_TEXT, 2);
         }
-        drawString(140, rowY + 18, quizNames[qi].c_str(), C_TEXT, 2);
+        drawString(90, rowY + 16, quizNames[qi].c_str(), C_TEXT, 2);
     }
+    drawBack();
     blit();
 }
 
 void listLoop(void) {
     drawList();
-    int dragStartY = 0;
+    for (int i = 0; i < LIST_ROWS; i++) {
+        int qi = listScroll + i;
+        if (qi >= 0 && qi < nQuizzes && quizHasBanner[qi] && !thumbSpr[i] && thumbFor[i] != qi)
+            queueThumb(i, qi);
+        if (thumbSpr[i]) { drawList(); }   // redraw when a thumb arrived
+    }
     bool dragging = false;
+    int dragStartY = 0;
     while (screen == SCR_LIST) {
         touch_step();
-        // tap a row
+        if (backHit(12, 12, 120, 44) && tapIn(12, 12, 120, 44)) { screen = SCR_MENU; return; }
         for (int i = 0; i < LIST_ROWS; i++) {
             int qi = listScroll + i;
             if (qi >= nQuizzes) break;
@@ -462,24 +517,23 @@ void listLoop(void) {
                 return;
             }
         }
-        // drag scroll
         if (tpActive) {
             if (!dragging) { dragging = true; dragStartY = tpY; }
             int dy = tpY - dragStartY;
-            if (dy < -30) { listScroll += 3; dragStartY = tpY; }
-            if (dy > 30) { listScroll -= 3; dragStartY = tpY; }
+            if (dy < -25) { listScroll += 3; dragStartY = tpY; }
+            if (dy > 25) { listScroll -= 3; dragStartY = tpY; }
             if (listScroll < 0) listScroll = 0;
             if (listScroll > nQuizzes - LIST_ROWS) listScroll = nQuizzes - LIST_ROWS;
             if (listScroll < 0) listScroll = 0;
             drawList();
-            // queue thumbnails for the visible rows
             for (int i = 0; i < LIST_ROWS; i++) {
                 int qi = listScroll + i;
                 if (qi >= 0 && qi < nQuizzes && quizHasBanner[qi] && !thumbSpr[i] && thumbFor[i] != qi)
                     queueThumb(i, qi);
             }
-        } else {
-            if (dragging) { dragging = false; drawList(); }
+        } else if (dragging) {
+            dragging = false;
+            drawList();
         }
         delay(10);
     }
@@ -493,7 +547,7 @@ struct QuizQ {
     String answers[MAX_A];
     int nAnswers;
     int correct[MAX_A];
-    int qtype;            // 0 mc, 1 type, 2 slider, 3 puzzle
+    int qtype;   // 0 mc, 1 type, 2 slider, 3 puzzle
     String typeAnswer;
     float sMin, sMax, sAnswer, sTol;
     String imgUrl;
@@ -510,7 +564,6 @@ int score = 0;
 int lastGain = 0;
 bool lastRight = false;
 unsigned long qStart = 0;
-
 uint16_t *qImgSpr = nullptr;
 int qImgW = 0, qImgH = 0;
 bool qImgGif = false;
@@ -522,9 +575,7 @@ void freeQuestionImage(void) {
 void loadQuestionImage(const String &url) {
     freeQuestionImage();
     qImgGif = false;
-    // url is like /UploadedImages/<quiz>/<file> - the 3DS format swaps ext to .565
-    String path = url + ".565";
-    fetchImage565(path, &qImgSpr, &qImgW, &qImgH, &qImgGif);
+    fetchImage565(url + ".565", &qImgSpr, &qImgW, &qImgH, &qImgGif);
 }
 
 bool fetchQuizQuestions(void) {
@@ -611,25 +662,29 @@ void submit(void) {
 }
 
 void drawPlay(void) {
-    fillRect(0, 0, FB_W, FB_H, C_BG);
+    drawBackground();
     QuizQ *q = &qs[qi];
     char hdr[64];
-    snprintf(hdr, 64, "Q%d/%d   Score: %d", qi + 1, nQ, score);
-    drawString(16, 12, hdr, C_DIM, 1);
+    snprintf(hdr, 64, "Q%d/%d      Score: %d", qi + 1, nQ, score);
+    drawCentered(14, hdr, C_FAINT, 1);
+    drawBack();
 
-    // question text (wrapped naively by words)
-    String line;
-    int y = 40;
-    drawString(16, y, q->question.c_str(), C_TEXT, 2);
-    y += 48;
+    // question (top-screen content, fitted)
+    int y = 66;
+    String lines[4];
+    int nl = wrapText(q->question.c_str(), FB_W - 48, 2, lines, 4);
+    for (int i = 0; i < nl; i++) {
+        drawString(24, y, lines[i].c_str(), C_TEXT, 2);
+        y += 22;
+    }
+    y += 4;
 
-    // image
     if (qImgGif) {
-        drawCentered(y + 20, "GIF skipped", C_DIM, 2);
-        y += 56;
+        drawCentered(y + 14, "GIF skipped", C_FAINT, 2);
+        y += 44;
     } else if (qImgSpr) {
         float sc = 1.0f;
-        int maxw = FB_W - 32, maxh = 220;
+        int maxw = FB_W - 48, maxh = 200;
         if (qImgW > maxw) sc = (float)maxw / qImgW;
         if (qImgH * sc > maxh) sc = (float)maxh / qImgH;
         int dw = qImgW * sc, dh = qImgH * sc;
@@ -638,71 +693,70 @@ void drawPlay(void) {
     }
 
     if (revealing) {
-        fillRect(16, y, FB_W - 32, 70, lastRight ? C_GOOD : C_BAD);
+        tile(24, y, FB_W - 48, 70, lastRight ? C_GOOD : C_BAD);
         char txt[80];
         snprintf(txt, 80, lastRight ? "Correct! +%d" : "Nope", lastGain);
-        drawCentered(y + 24, txt, C_BG, 2);
-        if (!lastRight) {
-            String correct = q->qtype == 0 ? q->answers[q->correct[0] == 1 ? 0 : 0] : "";
-            if (q->qtype == 0) {
-                for (int k = 0; k < q->nAnswers; k++)
-                    if (q->correct[k]) { correct = q->answers[k]; break; }
-            } else if (q->qtype == 1) correct = q->typeAnswer;
-            else if (q->qtype == 2) correct = String(q->sAnswer);
-            else correct = "(the listed order)";
-            drawCentered(y + 50, String("Answer: " + correct).c_str(), C_BG, 1);
-        }
-        fillRect(16, FB_H - 70, FB_W - 32, 54, C_BTN);
-        drawCentered(FB_H - 46, qi + 1 < nQ ? "Next" : "Finish", C_TEXT, 2);
+        drawCenteredShadow(y + 16, txt, C_INK, 2);
+        String correct;
+        if (q->qtype == 0) {
+            for (int k = 0; k < q->nAnswers; k++)
+                if (q->correct[k]) { correct = q->answers[k]; break; }
+        } else if (q->qtype == 1) correct = q->typeAnswer;
+        else if (q->qtype == 2) correct = String(q->sAnswer);
+        else correct = "the listed order";
+        drawCentered(y + 44, String("Answer: " + correct).c_str(), C_INK, 1);
+        tile(24, FB_H - 76, FB_W - 48, 60, C_GOLD);
+        drawCenteredShadow(FB_H - 50, qi + 1 < nQ ? "Next" : "Finish", C_INK, 2);
         blit();
         return;
     }
 
+    int avail = FB_H - 90 - y;
     if (q->qtype == 0) {
-        int bh = (FB_H - y - 90) / q->nAnswers;
-        if (bh > 64) bh = 64;
+        int bh = avail / q->nAnswers;
+        if (bh > 68) bh = 68;
+        int totalH = q->nAnswers * bh + (q->nAnswers - 1) * 8;
+        int ay = y + (avail - totalH) / 2;
+        if (ay < y) ay = y;
         for (int i = 0; i < q->nAnswers; i++) {
-            int by = y + i * (bh + 6);
-            uint16_t c = (selAns == i) ? C_SEL : C_BTN;
-            fillRect(16, by, FB_W - 32, bh, c);
-            drawString(32, by + bh / 2 - 8, q->answers[i].c_str(), C_TEXT, 2);
+            int by = ay + i * (bh + 8);
+            tile(24, by, FB_W - 48, bh, selAns == i ? C_GOLD : ansColor(i));
+            drawString(40, by + bh / 2 - 8, q->answers[i].c_str(), selAns == i ? C_INK : C_TEXT, 2);
         }
-        fillRect(16, FB_H - 70, FB_W - 32, 54, C_BTN2);
-        drawCentered(FB_H - 46, "Submit", C_BG, 2);
     } else if (q->qtype == 1) {
-        drawString(16, y, String("Your answer: " + typed).c_str(), C_TEXT, 2);
-        fillRect(16, y + 40, FB_W - 32, 54, C_BTN2);
-        drawCentered(y + 56, "Type answer", C_BG, 2);
-        fillRect(16, y + 106, FB_W - 32, 54, C_BTN2);
-        drawCentered(y + 122, "Submit", C_BG, 2);
+        glassPanel(24, y, FB_W - 48, 70, true);
+        drawCentered(y + 16, String("Your answer: " + typed).c_str(), C_TEXT, 2);
+        tile(24, y + 90, FB_W - 48, 60, ansColor(3));
+        drawCenteredShadow(y + 106, "Type answer", C_INK, 2);
+        tile(24, y + 162, FB_W - 48, 60, C_GOOD);
+        drawCenteredShadow(y + 178, "Submit", C_INK, 2);
     } else if (q->qtype == 2) {
         char txt[64];
-        snprintf(txt, 64, "%.1f  (%.1f - %.1f)", sVal, q->sMin, q->sMax);
-        drawCentered(y + 10, txt, C_TEXT, 2);
-        fillRect(60, y + 60, FB_W - 120, 40, C_PANEL);
-        drawRect(60, y + 60, FB_W - 120, 40, C_DIM);
+        snprintf(txt, 64, "%.1f    (%.1f - %.1f)", sVal, q->sMin, q->sMax);
+        drawCentered(y + 8, txt, C_TEXT, 2);
+        glassPanel(60, y + 50, FB_W - 120, 46, false);
         float t = (sVal - q->sMin) / (q->sMax - q->sMin);
-        fillRect(60, y + 60, (FB_W - 120) * t, 40, C_GOLD);
-        fillRect(16, FB_H - 70, FB_W - 32, 54, C_BTN2);
-        drawCentered(FB_H - 46, "Submit", C_BG, 2);
+        fillRect(60, y + 50, (FB_W - 120) * t, 46, C_GOLD);
+        tile(24, FB_H - 76, FB_W - 48, 60, C_GOOD);
+        drawCenteredShadow(FB_H - 50, "Submit", C_INK, 2);
     } else if (q->qtype == 3) {
-        int rh = (FB_H - y - 90) / q->nAnswers;
-        if (rh > 40) rh = 40;
+        int rh = (FB_H - 90 - y) / q->nAnswers;
+        if (rh > 44) rh = 44;
         for (int i = 0; i < q->nAnswers; i++) {
-            int ry = y + i * (rh + 5);
-            fillRect(16, ry, FB_W - 32, rh, C_BTN);
-            drawString(32, ry + rh / 2 - 8, q->answers[pOrder[i]].c_str(), C_TEXT, 2);
-            fillRect(FB_W - 70, ry, 54, rh, C_PANEL);
+            int ry = y + i * (rh + 6);
+            tile(24, ry, FB_W - 110, rh, ansColor(i));
+            drawString(40, ry + rh / 2 - 8, q->answers[pOrder[i]].c_str(), C_TEXT, 2);
+            glassPanel(FB_W - 76, ry, 52, rh, true);
             drawCentered(ry + rh / 2 - 8, "^", C_TEXT, 2);
         }
-        fillRect(16, FB_H - 70, FB_W - 32, 54, C_BTN2);
-        drawCentered(FB_H - 46, "Submit", C_BG, 2);
+        tile(24, FB_H - 76, FB_W - 48, 60, C_GOOD);
+        drawCenteredShadow(FB_H - 50, "Submit", C_INK, 2);
     }
     blit();
 }
 
 void playLoop(void) {
-    fillRect(0, 0, FB_W, FB_H, C_BG);
+    drawBackground();
     drawCentered(FB_H / 2 - 20, "Loading quiz...", C_TEXT, 2);
     blit();
     if (!fetchQuizQuestions()) {
@@ -716,8 +770,13 @@ void playLoop(void) {
     while (screen == SCR_PLAY) {
         touch_step();
         QuizQ *q = &qs[qi];
+        if (backHit(12, 12, 120, 44) && tapIn(12, 12, 120, 44) && !revealing) {
+            freeQuestionImage();
+            screen = SCR_MENU;
+            return;
+        }
         if (revealing) {
-            if (tapIn(16, FB_H - 70, FB_W - 32, 54)) {
+            if (tapIn(24, FB_H - 76, FB_W - 48, 60)) {
                 if (qi + 1 < nQ) { qi++; startQuestion(); }
                 else {
                     freeQuestionImage();
@@ -732,36 +791,37 @@ void playLoop(void) {
         }
         bool dirty = false;
         if (q->qtype == 0) {
-            int bh = (FB_H - 170 - 40) / q->nAnswers;
-            if (bh > 64) bh = 64;
+            int avail = FB_H - 90 - 150;
+            int bh = avail / q->nAnswers;
+            if (bh > 68) bh = 68;
+            int totalH = q->nAnswers * bh + (q->nAnswers - 1) * 8;
+            int ay = 150 + (avail - totalH) / 2;
+            if (ay < 150) ay = 150;
             for (int i = 0; i < q->nAnswers; i++) {
-                int by = 170 + i * (bh + 6);
-                if (tapIn(16, by, FB_W - 32, bh)) { selAns = i; dirty = true; }
-            }
-            if (tapIn(16, FB_H - 70, FB_W - 32, 54)) {
-                if (selAns >= 0) submit();
+                int by = ay + i * (bh + 8);
+                if (tapIn(24, by, FB_W - 48, bh)) { selAns = i; dirty = true; }
             }
         } else if (q->qtype == 1) {
-            if (tapIn(16, 170 + 40, FB_W - 32, 54)) { typed = keyboard("Type your answer", typed.c_str()); dirty = true; }
-            if (tapIn(16, 170 + 106, FB_W - 32, 54)) { submit(); }
+            if (tapIn(24, 150 + 90, FB_W - 48, 60)) { typed = keyboard("Type your answer", typed.c_str()); dirty = true; }
+            if (tapIn(24, 150 + 162, FB_W - 48, 60)) submit();
         } else if (q->qtype == 2) {
-            if (tpActive && tpX >= 60 && tpX <= FB_W - 60 && tpY >= 170 + 60 && tpY <= 170 + 100) {
+            if (tpActive && tpX >= 60 && tpX <= FB_W - 60 && tpY >= 150 + 50 && tpY <= 150 + 96) {
                 float t = (float)(tpX - 60) / (FB_W - 120);
                 sVal = q->sMin + t * (q->sMax - q->sMin);
                 dirty = true;
             }
-            if (tapIn(16, FB_H - 70, FB_W - 32, 54)) submit();
+            if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
         } else if (q->qtype == 3) {
-            int rh = (FB_H - 170 - 90) / q->nAnswers;
-            if (rh > 40) rh = 40;
+            int rh = (FB_H - 90 - 150) / q->nAnswers;
+            if (rh > 44) rh = 44;
             for (int i = 1; i < q->nAnswers; i++) {
-                int ry = 170 + i * (rh + 5);
-                if (tapIn(FB_W - 70, ry, 54, rh)) {
+                int ry = 150 + i * (rh + 6);
+                if (tapIn(FB_W - 76, ry, 52, rh)) {
                     int t = pOrder[i]; pOrder[i] = pOrder[i - 1]; pOrder[i - 1] = t;
                     dirty = true;
                 }
             }
-            if (tapIn(16, FB_H - 70, FB_W - 32, 54)) submit();
+            if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
         }
         if (dirty) drawPlay();
         delay(10);
@@ -770,9 +830,7 @@ void playLoop(void) {
 
 // ------------------------------------------------------------------ steal
 #define MAX_RESULTS 20
-String sUuid[MAX_RESULTS];
-String sTitle[MAX_RESULTS];
-String sCover[MAX_RESULTS];
+String sUuid[MAX_RESULTS], sTitle[MAX_RESULTS], sCover[MAX_RESULTS];
 int nResults = 0;
 uint16_t *sCovSpr[MAX_RESULTS] = { nullptr };
 int sCovW[MAX_RESULTS], sCovH[MAX_RESULTS];
@@ -789,7 +847,7 @@ void stealSearchNow(void) {
     freeStealCovers();
     String form = "q=" + urlEncode(stealSearch.c_str()) + "&count=20";
     HttpResp r = http_req("POST", "/api/searchkahoot", form);
-    if (r.status != 200) { stealMsg = "Search failed"; return; }
+    if (r.status != 200) { stealMsg = "Search failed (" + String(r.status) + ")"; return; }
     JsonDocument doc;
     if (deserializeJson(doc, r.body)) { stealMsg = "Bad response"; return; }
     for (JsonObject res : doc["results"].as<JsonArray>()) {
@@ -799,9 +857,7 @@ void stealSearchNow(void) {
         sCover[nResults] = res["cover"].as<String>();
         nResults++;
     }
-    if (nResults == 0) stealMsg = "No public quizzes found";
-    else stealMsg = "";
-    // fetch covers
+    stealMsg = nResults ? "" : "No public quizzes found";
     for (int i = 0; i < nResults; i++) {
         String p = "/api/kahootcover?id=" + urlEncode(sUuid[i].c_str())
                  + "&url=" + urlEncode(sCover[i].c_str()) + "&size=64";
@@ -811,27 +867,29 @@ void stealSearchNow(void) {
 }
 
 void drawSteal(void) {
-    fillRect(0, 0, FB_W, FB_H, C_BG);
-    drawCentered(16, "Steal from Kahoot", C_TEXT, 2);
-    fillRect(16, 56, FB_W - 220, 54, C_PANEL);
-    drawString(28, 72, stealSearch.c_str(), C_TEXT, 2);
-    fillRect(FB_W - 190, 56, 174, 54, C_BTN);
-    drawCentered(74, "Search", C_TEXT, 2);
-    fillRect(16, 122, FB_W - 32, 40, C_PANEL);
-    drawString(28, 130, "Tap a result to steal it.", C_DIM, 1);
-    for (int i = 0; i < nResults && i < 8; i++) {
-        int ry = 170 + i * 56;
-        fillRect(16, ry, FB_W - 32, 50, (i % 2) ? C_PANEL : RGB(38, 25, 58));
+    drawBackground();
+    drawCenteredShadow(14, "Steal from Kahoot", C_TEXT, 2);
+    drawBack();
+    glassPanel(16, 66, FB_W - 230, 60, false);
+    drawString(28, 82, stealSearch.c_str(), C_TEXT, 2);
+    tile(FB_W - 200, 66, 184, 60, ansColor(0));
+    drawCenteredShadow(82, "Search", C_INK, 2);
+    drawCentered(150, "Tap a result to steal it", C_FAINT, 1);
+    for (int i = 0; i < nResults && i < 7; i++) {
+        int ry = 176 + i * 58;
+        glassPanel(16, ry, FB_W - 32, 52, (i % 2) == 0);
         if (sCovSpr[i]) {
-            float sc = 44.0f / sCovH[i];
-            drawSprite(20, ry + 3, sCovSpr[i], sCovW[i], sCovH[i]);
+            float sc = 46.0f / sCovH[i];
+            int dw = sCovW[i] * sc;
+            if (dw > 70) dw = 70;
+            drawSprite(22, ry + 3, sCovSpr[i], sCovW[i], sCovH[i]);
         } else {
-            fillRect(20, ry + 3, 44, 44, C_DIM);
-            drawCentered(ry + 18, "?", C_BG, 2);
+            fillRect(22, ry + 3, 46, 46, C_INK);
+            drawCentered(ry + 18, "?", C_TEXT, 2);
         }
-        drawString(76, ry + 16, sTitle[i].c_str(), C_TEXT, 2);
+        drawString(86, ry + 16, sTitle[i].c_str(), C_TEXT, 2);
     }
-    if (stealMsg.length()) drawCentered(FB_H - 40, stealMsg.c_str(), C_GOLD, 1);
+    if (stealMsg.length()) drawCentered(FB_H - 28, stealMsg.c_str(), C_GOLD, 1);
     blit();
 }
 
@@ -840,18 +898,19 @@ void stealLoop(void) {
     drawSteal();
     while (screen == SCR_STEAL) {
         touch_step();
-        if (tapIn(16, 56, FB_W - 220, 54)) {
+        if (backHit(12, 12, 120, 44) && tapIn(12, 12, 120, 44)) { screen = SCR_MENU; return; }
+        if (tapIn(16, 66, FB_W - 230, 60)) {
             stealSearch = keyboard("Search Kahoot", stealSearch.c_str());
             stealSearchNow();
             drawSteal();
         }
-        if (tapIn(FB_W - 190, 56, 174, 54)) {
+        if (tapIn(FB_W - 200, 66, 184, 60)) {
             if (stealSearch.length()) { stealSearchNow(); drawSteal(); }
         }
-        for (int i = 0; i < nResults && i < 8; i++) {
-            int ry = 170 + i * 56;
-            if (tapIn(16, ry, FB_W - 32, 50)) {
-                fillRect(0, 0, FB_W, FB_H, C_BG);
+        for (int i = 0; i < nResults && i < 7; i++) {
+            int ry = 176 + i * 58;
+            if (tapIn(16, ry, FB_W - 32, 52)) {
+                drawBackground();
                 drawCentered(FB_H / 2 - 20, "Stealing...", C_TEXT, 2);
                 blit();
                 String form = "input=" + urlEncode(sUuid[i].c_str());
@@ -864,7 +923,7 @@ void stealLoop(void) {
                     }
                     stealMsg = "Stole it!";
                 } else {
-                    stealMsg = "Steal failed";
+                    stealMsg = "Steal failed (" + String(r.status) + ")";
                 }
                 drawSteal();
             }
@@ -875,13 +934,13 @@ void stealLoop(void) {
 
 // ------------------------------------------------------------------ config
 void configLoop(void) {
-    fillRect(0, 0, FB_W, FB_H, C_BG);
-    drawCentered(80, "Server settings", C_TEXT, 2);
-    drawCentered(160, String("Current: " + SERVER_HOST + ":" + String(SERVER_PORT)).c_str(), C_DIM, 1);
-    fillRect(80, 240, FB_W - 160, 90, C_BTN);
-    drawCentered(275, "Change address", C_TEXT, 2);
-    fillRect(80, 370, FB_W - 160, 90, C_BTN2);
-    drawCentered(405, "Back", C_BG, 2);
+    drawBackground();
+    drawCenteredShadow(70, "Server settings", C_TEXT, 2);
+    drawCentered(150, String("Current: " + SERVER_HOST + ":" + String(SERVER_PORT)).c_str(), C_FAINT, 1);
+    tile(80, 240, FB_W - 160, 90, ansColor(3));
+    drawCenteredShadow(272, "Change address", C_INK, 2);
+    tile(80, 370, FB_W - 160, 90, C_GOLD);
+    drawCenteredShadow(402, "Back", C_INK, 2);
     blit();
     while (screen == SCR_CONFIG) {
         touch_step();
@@ -894,12 +953,13 @@ void configLoop(void) {
             } else if (v.length()) {
                 SERVER_HOST = v;
             }
-            fillRect(0, 0, FB_W, FB_H, C_BG);
-            drawCentered(160, String("Current: " + SERVER_HOST + ":" + String(SERVER_PORT)).c_str(), C_DIM, 1);
-            fillRect(80, 240, FB_W - 160, 90, C_BTN);
-            drawCentered(275, "Change address", C_TEXT, 2);
-            fillRect(80, 370, FB_W - 160, 90, C_BTN2);
-            drawCentered(405, "Back", C_BG, 2);
+            drawBackground();
+            drawCenteredShadow(70, "Server settings", C_TEXT, 2);
+            drawCentered(150, String("Current: " + SERVER_HOST + ":" + String(SERVER_PORT)).c_str(), C_FAINT, 1);
+            tile(80, 240, FB_W - 160, 90, ansColor(3));
+            drawCenteredShadow(272, "Change address", C_INK, 2);
+            tile(80, 370, FB_W - 160, 90, C_GOLD);
+            drawCenteredShadow(402, "Back", C_INK, 2);
             blit();
         }
         if (tapIn(80, 370, FB_W - 160, 90)) { screen = SCR_MENU; return; }
@@ -912,8 +972,7 @@ void setup() {
     Serial.begin(115200);
     randomSeed(analogRead(0) + millis());
 
-    // touch_gt911_init() initialises I2C and the IO expander internally -
-    // calling DEV_I2C_Init() again would double-acquire the bus and crash.
+    // touch_gt911_init() initialises I2C and the IO expander internally.
     touch_gt911_init();
     waveshare_esp32_s3_rgb_lcd_init();
     wavesahre_rgb_lcd_bl_on();
@@ -921,14 +980,18 @@ void setup() {
     fb = (uint16_t *)heap_caps_malloc(FB_W * FB_H * 2, MALLOC_CAP_SPIRAM);
     memset(fb, 0, FB_W * FB_H * 2);
 
-    fillRect(0, 0, FB_W, FB_H, C_BG);
-    drawCentered(FB_H / 2 - 30, "QuizFabric", C_GOLD, 3);
-    drawCentered(FB_H / 2 + 20, "connecting to wifi...", C_DIM, 1);
+    drawBackground();
+    drawCenteredShadow(FB_H / 2 - 30, "QuizFabric", C_GOLD, 3);
+    drawCentered(FB_H / 2 + 24, "connecting to wifi...", C_FAINT, 1);
     blit();
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     for (int i = 0; WiFi.status() != WL_CONNECTED && i < 40; i++) delay(500);
+    if (WiFi.status() != WL_CONNECTED) {
+        drawCentered(FB_H / 2 + 50, "wifi failed - check settings", C_BAD, 1);
+        blit();
+    }
 }
 
 void loop() {
