@@ -393,7 +393,11 @@ HttpResp http_req(const char *method, const String &path, const String &formData
     if (chunked) {
         while (millis() < deadline) {
             if (c.available()) {
-                while (c.available()) r.body += (char)c.read();
+                int n = 0;
+                while (c.available()) {
+                    r.body += (char)c.read();
+                    if ((++n & 2047) == 0) delay(1);   // pace WiFi bursts
+                }
             } else if (!c.connected()) break;
             else delay(1);
         }
@@ -417,7 +421,11 @@ HttpResp http_req(const char *method, const String &path, const String &formData
     } else {
         while (millis() < deadline) {
             if (c.available()) {
-                while (c.available()) r.body += (char)c.read();
+                int n = 0;
+                while (c.available()) {
+                    r.body += (char)c.read();
+                    if ((++n & 2047) == 0) delay(1);   // pace WiFi bursts
+                }
             } else if (contentLen >= 0 && (int)r.body.length() >= contentLen) {
                 break;   // got everything the server promised
             } else if (!c.connected()) {
@@ -757,6 +765,7 @@ int qImgW = 0, qImgH = 0;
 bool qImgGif = false;
 int playControlsY = 150;   // y where the answer controls begin
 bool playNeedsFull = true; // next loop iteration must do a full drawPlay()
+bool qImgPending = false;  // question image loads lazily in the play loop
 
 void freeQuestionImage(void) {
     if (qImgSpr) { free(qImgSpr); qImgSpr = nullptr; }
@@ -777,8 +786,11 @@ bool fetchQuizQuestions(void) {
     JsonArray arr = doc.as<JsonArray>();
     nQ = arr.size();
     if (nQ > MAX_Q) nQ = MAX_Q;
-    if (qs) free(qs);
-    qs = (QuizQ *)malloc(sizeof(QuizQ) * nQ);
+    if (nQ <= 0) return false;   // empty/invalid quiz - don't crash on it
+    // new[] runs the String constructors - malloc left them uninitialised
+    // and the first assignment corrupted the heap (crash + reboot).
+    if (qs) delete[] qs;
+    qs = new QuizQ[nQ];
     for (int i = 0; i < nQ; i++) {
         JsonObject q = arr[i];
         QuizQ *qq = &qs[i];
@@ -798,6 +810,7 @@ bool fetchQuizQuestions(void) {
         else if (!strcmp(t, "slider")) qq->qtype = 2;
         else if (!strcmp(t, "puzzle")) qq->qtype = 3;
         else qq->qtype = 1;
+        if (qq->nAnswers <= 0) qq->qtype = 1;   // never divide by an empty answer list
         qq->typeAnswer = q["answer"].as<String>();
         qq->sMin = q["min"] | 0.0f;
         qq->sMax = q["max"] | 100.0f;
@@ -825,7 +838,10 @@ void startQuestion(void) {
             int t = pOrder[i]; pOrder[i] = pOrder[j]; pOrder[j] = t;
         }
     }
-    if (q->imgUrl.length()) loadQuestionImage(q->imgUrl);
+    // Load the question image lazily inside the play loop (after the
+    // question itself is on screen) so a big image fetch can't block
+    // quiz entry or starve the LCD bus all at once.
+    qImgPending = q->imgUrl.length() > 0;
     playNeedsFull = true;
 }
 
@@ -1019,6 +1035,13 @@ void playLoop(void) {
         }
         // Full redraw only when the question (or reveal state) changed.
         if (playNeedsFull) { drawPlay(); playNeedsFull = false; }
+        // Lazy question image: fetch it once the question is on screen
+        // and no finger is down, then redraw with the image included.
+        if (qImgPending && !tpActive) {
+            qImgPending = false;
+            if (q->imgUrl.length()) loadQuestionImage(q->imgUrl);
+            playNeedsFull = true;
+        }
         if (revealing) {
             if (tapIn(24, FB_H - 76, FB_W - 48, 60)) {
                 if (qi + 1 < nQ) { qi++; startQuestion(); }
@@ -1249,6 +1272,9 @@ void setup() {
     blit();
 
     WiFi.mode(WIFI_STA);
+    // No modem sleep: the radio's sleep/wake cycles disturb the RGB LCD
+    // DMA timing and make the screen flicker, especially during transfers.
+    WiFi.setSleep(false);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     for (int i = 0; WiFi.status() != WL_CONNECTED && i < 40; i++) delay(500);
     if (WiFi.status() != WL_CONNECTED) {
