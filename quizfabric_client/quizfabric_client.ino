@@ -1016,12 +1016,16 @@ void drawPlayReveal(void) {
 }
 
 // Geometry for one mc answer tile (shared by drawing and tap handling).
+// The whole block MUST fit inside avail: the 68px cap used to make the
+// block taller than avail for 5+ answers, so the last tiles covered the
+// Submit button and taps on Submit hit an answer tile instead.
 void mcTileRect(int i, int *ty, int *th) {
     QuizQ *q = &qs[qi];
     int avail = FB_H - 90 - playControlsY;
     int bh = avail / q->nAnswers;
     if (bh > 68) bh = 68;
     int totalH = q->nAnswers * bh + (q->nAnswers - 1) * 8;
+    while (totalH > avail && bh > 14) { bh--; totalH = q->nAnswers * bh + (q->nAnswers - 1) * 8; }
     int ay = playControlsY + (avail - totalH) / 2;
     if (ay < playControlsY) ay = playControlsY;
     *ty = ay + i * (bh + 8);
@@ -1039,8 +1043,10 @@ void drawMcTileOnly(int i) {
 
 void puzzleRowRect(int i, int *ry, int *rh) {
     QuizQ *q = &qs[qi];
-    int h = (FB_H - 90 - playControlsY) / q->nAnswers;
+    int avail = FB_H - 90 - playControlsY;
+    int h = avail / q->nAnswers;
     if (h > 44) h = 44;
+    while (q->nAnswers * (h + 6) > avail && h > 10) h--;   // keep clear of Submit
     *ry = playControlsY + i * (h + 6);
     *rh = h;
 }
@@ -1155,25 +1161,29 @@ void playLoop(void) {
         }
         int y = playControlsY;
         if (q->qtype == 0) {
-            for (int i = 0; i < q->nAnswers; i++) {
-                int ty, th;
-                mcTileRect(i, &ty, &th);
-                if (tapIn(24, ty, FB_W - 48, th) && selAns != i) {
-                    // Repaint only the two tiles that change (old gold
-                    // one + newly tapped one) - tiny repaints, no tearing.
-                    int oldSel = selAns;
-                    selAns = i;
-                    if (oldSel >= 0) {
-                        int oy, oh;
-                        mcTileRect(oldSel, &oy, &oh);
-                        drawMcTileOnly(oldSel);
-                        blitRect(24, oy, FB_W - 48, oh);
+            // Submit is checked first so it wins even if an answer tile
+            // edge overlaps it.
+            if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
+            else {
+                for (int i = 0; i < q->nAnswers; i++) {
+                    int ty, th;
+                    mcTileRect(i, &ty, &th);
+                    if (tapIn(24, ty, FB_W - 48, th) && selAns != i) {
+                        // Repaint only the two tiles that change (old gold
+                        // one + newly tapped one) - tiny repaints, no tearing.
+                        int oldSel = selAns;
+                        selAns = i;
+                        if (oldSel >= 0) {
+                            int oy, oh;
+                            mcTileRect(oldSel, &oy, &oh);
+                            drawMcTileOnly(oldSel);
+                            blitRect(24, oy, FB_W - 48, oh);
+                        }
+                        drawMcTileOnly(i);
+                        blitRect(24, ty, FB_W - 48, th);
                     }
-                    drawMcTileOnly(i);
-                    blitRect(24, ty, FB_W - 48, th);
                 }
             }
-            if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
         } else if (q->qtype == 1) {
             // The keyboard overwrites the whole screen, so it needs a full
             // redraw on return, not just the controls region.
@@ -1189,20 +1199,22 @@ void playLoop(void) {
             }
             if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
         } else if (q->qtype == 3) {
-            for (int i = 1; i < q->nAnswers; i++) {
-                int ry, rh;
-                puzzleRowRect(i, &ry, &rh);
-                if (tapIn(FB_W - 76, ry, 52, rh)) {
-                    int t = pOrder[i]; pOrder[i] = pOrder[i - 1]; pOrder[i - 1] = t;
-                    // Repaint only the two rows that swapped.
-                    int ry0, rh0;
-                    puzzleRowRect(i - 1, &ry0, &rh0);
-                    drawPuzzleRowOnly(i - 1);
-                    drawPuzzleRowOnly(i);
-                    blitRect(24, ry0, FB_W - 48, rh0 + 6 + rh);
+            if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
+            else {
+                for (int i = 1; i < q->nAnswers; i++) {
+                    int ry, rh;
+                    puzzleRowRect(i, &ry, &rh);
+                    if (tapIn(FB_W - 76, ry, 52, rh)) {
+                        int t = pOrder[i]; pOrder[i] = pOrder[i - 1]; pOrder[i - 1] = t;
+                        // Repaint only the two rows that swapped.
+                        int ry0, rh0;
+                        puzzleRowRect(i - 1, &ry0, &rh0);
+                        drawPuzzleRowOnly(i - 1);
+                        drawPuzzleRowOnly(i);
+                        blitRect(24, ry0, FB_W - 48, rh0 + 6 + rh);
+                    }
                 }
             }
-            if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
         }
         delay(10);
     }
