@@ -1930,19 +1930,24 @@ void joinLoop(void) {
 // ------------------------------------------------------------------ setup/loop
 void setup() {
     Serial.begin(115200);
+    Serial.println("boot: serial up");
     randomSeed(analogRead(0) + millis());
-    loadServerPrefs();   // saved server address from NVS
+    Serial.println("boot: touch init...");
 
     // touch_gt911_init() initialises I2C and the IO expander internally.
     touch_gt911_init();
+    Serial.println("boot: touch ok");
     fetchTaskStart();   // background downloads so touch never blocks
+    Serial.println("boot: fetch task ok");
     waveshare_esp32_s3_rgb_lcd_init();
+    Serial.println("boot: lcd init ok");
     wavesahre_rgb_lcd_bl_on();
 
     void *fb1 = nullptr, *fb2 = nullptr;
     waveshare_get_frame_buffer(&fb1, &fb2);
     fb = (uint16_t *)fb1;
     memset(fb, 0, FB_W * FB_H * 2);
+    Serial.println("boot: framebuffer ok");
 
     drawBackground();
     drawCenteredShadow(FB_H / 2 - 30, "QuizFabric", C_GOLD, 3);
@@ -1955,10 +1960,18 @@ void setup() {
     WiFi.setSleep(false);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     for (int i = 0; WiFi.status() != WL_CONNECTED && i < 40; i++) delay(500);
+    Serial.println(WiFi.status() == WL_CONNECTED ? "boot: wifi ok" : "boot: wifi failed");
     if (WiFi.status() != WL_CONNECTED) {
         drawCentered(FB_H / 2 + 50, "wifi failed - check settings", C_BAD, 1);
         blit();
     }
+
+    // Saved server address (NVS) - loaded last so a Preferences problem
+    // can never take the display or WiFi down.
+    loadServerPrefs();
+    Serial.println("boot: prefs ok");
+    Serial.printf("boot: heap %u\n", ESP.getFreeHeap());
+    Serial.println("boot: done, entering menu");
 }
 
 void loop() {
