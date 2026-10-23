@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QuizFabric 7B Flasher</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #181028;
+      color: #f0f0f5;
+      max-width: 640px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+    h1 { color: #facd15; }
+    button {
+      font-size: 1.1rem;
+      padding: 12px 28px;
+      margin: 8px 8px 8px 0;
+      border: none;
+      border-radius: 8px;
+      background: #4f46e5;
+      color: #fff;
+      cursor: pointer;
+    }
+    button:disabled { background: #555; cursor: not-allowed; }
+    button#flash { background: #22c55e; color: #111; }
+    #log {
+      background: #0c0815;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 12px;
+      margin-top: 20px;
+      white-space: pre-wrap;
+      font-family: ui-monospace, monospace;
+      font-size: 0.9rem;
+      min-height: 200px;
+      max-height: 380px;
+      overflow-y: auto;
+    }
+    .step { color: #a0a0af; margin: 4px 0; }
+  </style>
+</head>
+<body>
+  <h1>QuizFabric — Waveshare 7B flasher</h1>
+  <p class="step">1. Plug the 7B's <b>UART</b> USB-C port into this PC.</p>
+  <p class="step">2. Click <b>Connect</b> and pick the serial port.</p>
+  <p class="step">3. Click <b>Flash</b>. The board reboots into the client when done.</p>
+  <p class="step">Needs a Web Serial browser (Chrome or Edge).</p>
+  <button id="connect">Connect</button>
+  <button id="flash" disabled>Flash</button>
+  <pre id="log"></pre>
+
+  <script type="module">
+    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js/bundle.js";
+
+    const logEl = document.getElementById('log');
+    let loader = null;
+    let port = null;
+
+    function log(m) {
+      logEl.textContent += m + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    document.getElementById('connect').onclick = async () => {
+      try {
+        port = await navigator.serial.requestPort({});
+        await port.open({ baudRate: 115200 });
+        const transport = new Transport(port);
+        loader = new ESPLoader({ transport, baudrate: 115200, romBaudrate: 115200, enableTracing: false, debug: false });
+        await loader.main_fn();   // sync + enter download mode
+        log('Connected. Chip: ' + (loader.chip ? loader.chip.CHIP_NAME : 'ESP32-S3'));
+        log('Ready to flash.');
+        document.getElementById('flash').disabled = false;
+      } catch (e) {
+        log('Connect failed: ' + e.message);
+      }
+    };
+
+    document.getElementById('flash').onclick = async () => {
+      try {
+        log('Fetching firmware from this repo...');
+        const resp = await fetch('../quizfabric-client.bin');
+        if (!resp.ok) throw new Error('firmware fetch failed (' + resp.status + ')');
+        const bin = new Uint8Array(await resp.arrayBuffer());
+        log('Firmware: ' + bin.length + ' bytes');
+        log('Erasing + flashing... (this takes ~30-60s)');
+        let lastPct = -1;
+        await loader.write_flash({
+          fileArray: [{ data: bin, address: 0x0 }],
+          flashSize: 'keep',
+          eraseAll: true,
+          compress: true,
+          reportProgress: (fileIndex, written, total) => {
+            const pct = Math.floor((100 * written) / total);
+            if (pct !== lastPct) {
+              lastPct = pct;
+              log('  ' + pct + '%');
+            }
+          },
+        });
+        log('Done! Rebooting into QuizFabric...');
+        await loader.hard_reset();
+        log('Flashed successfully.');
+      } catch (e) {
+        log('Flash failed: ' + e.message);
+        log('Unplug and reconnect the board, click Connect, then Flash again.');
+      } finally {
+        document.getElementById('flash').disabled = true;
+        if (port) { try { await port.close(); } catch (e) {} }
+      }
+    };
+  </script>
+</body>
+</html>
