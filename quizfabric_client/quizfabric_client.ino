@@ -22,8 +22,8 @@
 const char *WIFI_SSID = "VM6842809";
 const char *WIFI_PASS = "h2hFnrycpprn";
 
-String SERVER_HOST = "192.168.50.65";
-int SERVER_PORT = 5710;
+String SERVER_HOST = "play.lucasgeitgey.com";
+int SERVER_PORT = 80;
 
 // ------------------------------------------------------------------ display
 static const int FB_W = EXAMPLE_LCD_H_RES;   // 1024
@@ -303,12 +303,17 @@ HttpResp http_req(const char *method, const String &path, const String &formData
     }
     // headers
     unsigned long deadline = millis() + 10000;
+    int contentLen = -1;
     while (c.connected() && millis() < deadline) {
         if (!c.available()) { delay(1); continue; }
         String l = c.readStringUntil('\n');
         if (l.startsWith("HTTP/")) r.status = l.substring(9, 12).toInt();
+        if (l.startsWith("Content-Length:")) contentLen = l.substring(15).toInt();
         if (l == "\r" || l.length() == 1) break;   // blank line = end of headers
     }
+    // Reserve the body up front: String += without reserve is O(n^2)
+    // and freezes the ESP32 for seconds on large quiz JSON.
+    if (contentLen > 0) r.body.reserve(contentLen + 1);
     // body: read until the connection closes (or timeout)
     deadline = millis() + 15000;
     while (millis() < deadline) {
@@ -349,11 +354,14 @@ bool fetchImage565(const String &path, uint16_t **spr, int *w, int *h, bool *isG
 
 // ------------------------------------------------------------------ keyboard
 String keyboard(const char *hint, const char *initial) {
-    static const char *rows[3] = { "qwertyuiop", "asdfghjkl", "zxcvbnm1234567890" };
+    // Numbers on top; shift turns them into symbols (1=! 2=@ 3=# 4=$ 5=%
+    // 6=. 7=: 8=* 9=( 0=)) and letters into uppercase.
+    static const char *rows[4] = { "1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm" };
+    static const char *syms = "!@#$%.:*()";
     String out = initial ? initial : "";
     bool shift = false;
     int baseY = 132;
-    int cy = baseY + 3 * 72 + 12;
+    int cy = baseY + 4 * 72 + 12;
     String lastOut = "\x01";   // force first paint
     bool lastShift = !shift;
     while (true) {
@@ -367,15 +375,16 @@ String keyboard(const char *hint, const char *initial) {
             drawCentered(30, hint, C_FAINT, 1);
             drawCentered(62, out.c_str(), C_TEXT, 2);
 
-            for (int r = 0; r < 3; r++) {
+            for (int r = 0; r < 4; r++) {
                 const char *row = rows[r];
                 int n = strlen(row);
                 int kw = (FB_W - 60) / n;
                 for (int i = 0; i < n; i++) {
                     int x = 30 + i * kw;
                     char ch = row[i];
-                    if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
-                    tile(x, baseY + r * 72, kw - 8, 64, ansColor(r));
+                    if (r == 0) { if (shift) ch = syms[i]; }
+                    else if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
+                    tile(x, baseY + r * 72, kw - 8, 64, r == 0 ? C_GLASS : ansColor(r));
                     char b[2] = { ch, 0 };
                     drawCenteredAt(x + (kw - 8) / 2, baseY + r * 72 + 20, b, C_TEXT, 2);
                 }
@@ -392,7 +401,7 @@ String keyboard(const char *hint, const char *initial) {
         if (tapIn(280, cy, 200, 64)) shift = !shift;
         if (tapIn(500, cy, 200, 64)) { if (out.length()) out.remove(out.length() - 1); }
         if (tapIn(720, cy, 274, 64)) { touch_wait_release(); return out; }
-        for (int r = 0; r < 3; r++) {
+        for (int r = 0; r < 4; r++) {
             const char *row = rows[r];
             int n = strlen(row);
             int kw = (FB_W - 60) / n;
@@ -400,7 +409,8 @@ String keyboard(const char *hint, const char *initial) {
                 int x = 30 + i * kw;
                 if (tapIn(x, baseY + r * 72, kw - 8, 64)) {
                     char ch = row[i];
-                    if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
+                    if (r == 0) { if (shift) ch = syms[i]; }
+                    else if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
                     if (out.length() < 120) out += ch;
                 }
             }
@@ -433,15 +443,25 @@ void freeThumbs(void) {
     }
 }
 
-void queueThumb(int slot, int qi) {
-    if (thumbSpr[slot] || thumbFor[slot] == qi) return;
-    thumbFor[slot] = qi;
-    bool gif = false;
-    uint16_t *s = nullptr; int w = 0, h = 0;
-    String enc = urlEncode(quizNames[qi].c_str());
-    if (fetchImage565("/api/quizbanner/" + enc, &s, &w, &h, &gif) && s) {
-        thumbSpr[slot] = s; thumbW[slot] = w; thumbH[slot] = h;
+// Load one pending banner thumbnail, one per idle frame. Returns true if
+// something was loaded (caller redraws). Never call this while a finger is
+// down: the fetch is blocking and would make taps freeze.
+bool pumpThumb(void) {
+    for (int i = 0; i < LIST_ROWS; i++) {
+        int qi = listScroll + i;
+        if (qi < 0 || qi >= nQuizzes) continue;
+        if (!quizHasBanner[qi] || thumbSpr[i] || thumbFor[i] == qi) continue;
+        thumbFor[i] = qi;
+        bool gif = false;
+        uint16_t *s = nullptr; int w = 0, h = 0;
+        String enc = urlEncode(quizNames[qi].c_str());
+        if (fetchImage565("/api/quizbanner/" + enc, &s, &w, &h, &gif) && s) {
+            thumbSpr[i] = s; thumbW[i] = w; thumbH[i] = h;
+            return true;
+        }
+        return false;
     }
+    return false;
 }
 
 void fetchQuizList(void) {
@@ -515,15 +535,14 @@ void drawList(void) {
 
 void listLoop(void) {
     drawList();
-    for (int i = 0; i < LIST_ROWS; i++) {
-        int qi = listScroll + i;
-        if (qi >= 0 && qi < nQuizzes && quizHasBanner[qi] && !thumbSpr[i] && thumbFor[i] != qi)
-            queueThumb(i, qi);
-        if (thumbSpr[i]) { drawList(); }   // redraw when a thumb arrived
-    }
     bool dragging = false;
     int dragStartY = 0;
+    int lastScroll = listScroll;
     while (screen == SCR_LIST) {
+        // Load one banner per idle frame. Never during a touch: the HTTP
+        // fetch is blocking and was freezing taps.
+        if (!tpActive && pumpThumb()) drawList();
+
         touch_step();
         if (backHit(12, 12, 120, 44) && tapIn(12, 12, 120, 44)) { screen = SCR_MENU; return; }
         for (int i = 0; i < LIST_ROWS; i++) {
@@ -544,11 +563,11 @@ void listLoop(void) {
             if (listScroll < 0) listScroll = 0;
             if (listScroll > nQuizzes - LIST_ROWS) listScroll = nQuizzes - LIST_ROWS;
             if (listScroll < 0) listScroll = 0;
-            drawList();
-            for (int i = 0; i < LIST_ROWS; i++) {
-                int qi = listScroll + i;
-                if (qi >= 0 && qi < nQuizzes && quizHasBanner[qi] && !thumbSpr[i] && thumbFor[i] != qi)
-                    queueThumb(i, qi);
+            // Redraw only when the scroll actually moved: a full redraw
+            // every frame while touching tears the single framebuffer.
+            if (listScroll != lastScroll) {
+                lastScroll = listScroll;
+                drawList();
             }
         } else if (dragging) {
             dragging = false;
@@ -786,6 +805,7 @@ void playLoop(void) {
     qi = 0;
     score = 0;
     startQuestion();
+    drawPlay();   // show the first question right away, not only after a touch
     while (screen == SCR_PLAY) {
         touch_step();
         QuizQ *q = &qs[qi];
