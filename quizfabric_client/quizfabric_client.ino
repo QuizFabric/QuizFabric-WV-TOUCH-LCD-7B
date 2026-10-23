@@ -235,17 +235,28 @@ bool tpActive = false;
 int tpX = 0, tpY = 0;
 unsigned long tpDownMs = 0;
 bool tapConsumed = false;
+static bool tpPending = false;
+static bool tpPendingState = false;
 
 void touch_step(void) {
     tp = touch_gt911_read_point(1);
     bool active = tp.cnt > 0;
-    if (active && !tpActive) {
+    if (active && tpActive) { tpX = tp.x[0]; tpY = tp.y[0]; return; }
+    if (!active && !tpActive) { tpPending = false; return; }
+    // Edge: the GT911 occasionally drops points mid-touch while polling,
+    // which fakes releases (and re-presses) and makes taps unreliable.
+    // Confirm every edge with one more identical read before committing.
+    if (!tpPending) { tpPending = true; tpPendingState = active; return; }
+    if (tpPendingState != active) { tpPendingState = active; return; }
+    tpPending = false;
+    if (active) {
         tpActive = true;
         tpDownMs = millis();
         tapConsumed = false;
+        tpX = tp.x[0]; tpY = tp.y[0];
+    } else {
+        tpActive = false;
     }
-    if (active) { tpX = tp.x[0]; tpY = tp.y[0]; }
-    if (!active && tpActive) tpActive = false;
 }
 
 bool tapIn(int x, int y, int w, int h) {
@@ -439,6 +450,62 @@ HttpResp http_req(const char *method, const String &path, const String &formData
     return r;
 }
 
+// ------------------------------------------------------------------ async fetch
+// Banners / question images / covers are downloaded on this background
+// task. The touch loops used to block on those fetches and ate taps (the
+// quiz list needed ~60 taps to register; Submit was dead while a question
+// image loaded). One job at a time; job IDs let callers discard results
+// from a superseded job.
+static TaskHandle_t fetchTaskH = NULL;
+static SemaphoreHandle_t fetchLock = NULL;
+static String fetchPath;
+static volatile uint32_t fetchJobId = 0;
+static String fetchBody;
+static int fetchStatus = -1;
+static volatile uint32_t fetchDoneId = 0;
+
+void fetchTaskFn(void *arg) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        xSemaphoreTake(fetchLock, portMAX_DELAY);
+        String p = fetchPath;
+        uint32_t jid = fetchJobId;
+        xSemaphoreGive(fetchLock);
+        HttpResp r = http_req("GET", p);
+        xSemaphoreTake(fetchLock, portMAX_DELAY);
+        if (jid == fetchJobId) {   // not superseded by a newer job
+            fetchBody = r.body;
+            fetchStatus = r.status;
+            fetchDoneId = jid;
+        }
+        xSemaphoreGive(fetchLock);
+    }
+}
+
+void fetchTaskStart(void) {
+    fetchLock = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(fetchTaskFn, "fetch", 10240, NULL, 1, &fetchTaskH, 0);
+}
+
+// Ask the task to fetch a path. Returns the job id to pass to fetchTake.
+uint32_t fetchStart(const String &path) {
+    xSemaphoreTake(fetchLock, portMAX_DELAY);
+    fetchPath = path;
+    fetchJobId++;
+    xSemaphoreGive(fetchLock);
+    xTaskNotifyGive(fetchTaskH);
+    return fetchJobId;
+}
+
+// True when the result for jobId (or a newer one) is ready; copies it out.
+bool fetchTake(uint32_t jobId, String &body, int *status) {
+    xSemaphoreTake(fetchLock, portMAX_DELAY);
+    bool ok = jobId != 0 && fetchDoneId >= jobId;
+    if (ok) { body = fetchBody; *status = fetchStatus; }
+    xSemaphoreGive(fetchLock);
+    return ok;
+}
+
 String urlEncode(const char *s) {
     String out;
     for (; *s; s++) {
@@ -451,15 +518,6 @@ String urlEncode(const char *s) {
         }
     }
     return out;
-}
-
-bool fetchImage565(const String &path, uint16_t **spr, int *w, int *h, bool *isGif) {
-    HttpResp r = http_req("GET", path);
-    *isGif = false;
-    if (r.status != 200 || r.body.length() < 6) return false;
-    const uint8_t *d = (const uint8_t *)r.body.c_str();
-    if (d[4] >= 2) { *isGif = true; return false; }
-    return decode565(d, r.body.length(), spr, w, h);
 }
 
 // ------------------------------------------------------------------ keyboard
@@ -561,23 +619,36 @@ void freeThumbs(void) {
     }
 }
 
-// Load one pending banner thumbnail, one per idle frame. Returns the slot
-// that got a new thumbnail (caller redraws that row), or -1. Never call
-// this while a finger is down: the fetch is blocking and would make taps
-// freeze.
+// Non-blocking banner loader: keeps one fetch in flight on the background
+// task and polls it. Returns the slot that just got its thumbnail (caller
+// repaints), or -1. The touch loop never blocks.
+static int thumbFetchSlot = -1;
+static uint32_t thumbJobId = 0;
+
 int pumpThumb(void) {
+    if (thumbJobId) {
+        int status = -1;
+        String body;
+        if (!fetchTake(thumbJobId, body, &status)) return -1;   // still loading
+        thumbJobId = 0;
+        int slot = thumbFetchSlot;
+        if (status == 200) {
+            uint16_t *s = nullptr; int w = 0, h = 0;
+            if (decode565((const uint8_t *)body.c_str(), body.length(), &s, &w, &h)) {
+                thumbSpr[slot] = s; thumbW[slot] = w; thumbH[slot] = h;
+                return slot;
+            }
+        }
+        return -1;
+    }
     for (int i = 0; i < LIST_ROWS; i++) {
         int qi = listScroll + i;
         if (qi < 0 || qi >= nQuizzes) continue;
         if (!quizHasBanner[qi] || thumbSpr[i] || thumbFor[i] == qi) continue;
         thumbFor[i] = qi;
-        bool gif = false;
-        uint16_t *s = nullptr; int w = 0, h = 0;
+        thumbFetchSlot = i;
         String enc = urlEncode(quizNames[qi].c_str());
-        if (fetchImage565("/api/quizbanner/" + enc, &s, &w, &h, &gif) && s) {
-            thumbSpr[i] = s; thumbW[i] = w; thumbH[i] = h;
-            return i;
-        }
+        thumbJobId = fetchStart("/api/quizbanner/" + enc);
         return -1;
     }
     return -1;
@@ -624,7 +695,16 @@ void menuLoop(void) {
     drawMenu();
     while (screen == SCR_MENU) {
         touch_step();
-        if (tapIn(80, 220, FB_W - 160, 90)) { screen = SCR_LIST; fetchQuizList(); return; }
+        if (tapIn(80, 220, FB_W - 160, 90)) {
+            // Show feedback immediately so the tap visibly registered,
+            // then block on the quiz-list fetch (one-time, at transition).
+            drawBackground();
+            drawCentered(FB_H / 2 - 20, "Loading quizzes...", C_TEXT, 2);
+            blit();
+            screen = SCR_LIST;
+            fetchQuizList();
+            return;
+        }
         if (tapIn(80, 340, FB_W - 160, 90)) { screen = SCR_STEAL; return; }
         if (tapIn(80, 460, FB_W - 160, 90)) { screen = SCR_CONFIG; return; }
         delay(10);
@@ -765,16 +845,28 @@ int qImgW = 0, qImgH = 0;
 bool qImgGif = false;
 int playControlsY = 150;   // y where the answer controls begin
 bool playNeedsFull = true; // next loop iteration must do a full drawPlay()
-bool qImgPending = false;  // question image loads lazily in the play loop
+uint32_t qImgJobId = 0;    // background fetch job for the question image
 
 void freeQuestionImage(void) {
     if (qImgSpr) { free(qImgSpr); qImgSpr = nullptr; }
 }
 
-void loadQuestionImage(const String &url) {
-    freeQuestionImage();
-    qImgGif = false;
-    fetchImage565(url + ".565", &qImgSpr, &qImgW, &qImgH, &qImgGif);
+// Poll the background question-image fetch; redraws when it lands.
+void pollQuestionImage(void) {
+    if (!qImgJobId) return;
+    int status = -1;
+    String body;
+    if (!fetchTake(qImgJobId, body, &status)) return;   // still loading
+    qImgJobId = 0;
+    if (status == 200 && body.length() > 6) {
+        uint16_t *s = nullptr; int w = 0, h = 0;
+        if (decode565((const uint8_t *)body.c_str(), body.length(), &s, &w, &h)) {
+            qImgSpr = s; qImgW = w; qImgH = h;
+        } else if ((uint8_t)body[4] >= 2) {
+            qImgGif = true;   // animated - skipped
+        }
+    }
+    playNeedsFull = true;
 }
 
 bool fetchQuizQuestions(void) {
@@ -838,10 +930,11 @@ void startQuestion(void) {
             int t = pOrder[i]; pOrder[i] = pOrder[j]; pOrder[j] = t;
         }
     }
-    // Load the question image lazily inside the play loop (after the
-    // question itself is on screen) so a big image fetch can't block
-    // quiz entry or starve the LCD bus all at once.
-    qImgPending = q->imgUrl.length() > 0;
+    // Question image downloads on the background task; the play loop
+    // polls it so touch stays responsive.
+    qImgJobId = 0;
+    qImgGif = false;
+    if (q->imgUrl.length()) qImgJobId = fetchStart(q->imgUrl + ".565");
     playNeedsFull = true;
 }
 
@@ -1035,13 +1128,8 @@ void playLoop(void) {
         }
         // Full redraw only when the question (or reveal state) changed.
         if (playNeedsFull) { drawPlay(); playNeedsFull = false; }
-        // Lazy question image: fetch it once the question is on screen
-        // and no finger is down, then redraw with the image included.
-        if (qImgPending && !tpActive) {
-            qImgPending = false;
-            if (q->imgUrl.length()) loadQuestionImage(q->imgUrl);
-            playNeedsFull = true;
-        }
+        // Poll the background question-image fetch (non-blocking).
+        pollQuestionImage();
         if (revealing) {
             if (tapIn(24, FB_H - 76, FB_W - 48, 60)) {
                 if (qi + 1 < nQ) { qi++; startQuestion(); }
@@ -1123,9 +1211,48 @@ void freeStealCovers(void) {
         if (sCovSpr[i]) { free(sCovSpr[i]); sCovSpr[i] = nullptr; }
 }
 
+static int sCovIdx = 0;
+static uint32_t sCovJobId = 0;
+
+// One cover at a time on the background task; returns the row whose
+// cover just arrived (caller repaints it), or -1. Never blocks.
+int pumpStealCovers(void) {
+    if (sCovJobId) {
+        int status = -1;
+        String body;
+        if (!fetchTake(sCovJobId, body, &status)) return -1;   // still loading
+        sCovJobId = 0;
+        int idx = sCovIdx;
+        sCovIdx++;
+        if (status == 200) {
+            uint16_t *s = nullptr; int w = 0, h = 0;
+            if (decode565((const uint8_t *)body.c_str(), body.length(), &s, &w, &h)) {
+                sCovSpr[idx] = s; sCovW[idx] = w; sCovH[idx] = h;
+                return idx;
+            }
+        }
+        return -1;
+    }
+    while (sCovIdx < nResults) {
+        if (sCover[sCovIdx].length()) {
+            String p = "/api/kahootcover?id=" + urlEncode(sUuid[sCovIdx].c_str())
+                     + "&url=" + urlEncode(sCover[sCovIdx].c_str()) + "&size=64";
+            sCovJobId = fetchStart(p);
+            break;
+        }
+        sCovIdx++;
+    }
+    return -1;
+}
+
 void stealSearchNow(void) {
     nResults = 0;
     freeStealCovers();
+    sCovJobId = 0;
+    sCovIdx = 0;
+    drawBackground();
+    drawCentered(FB_H / 2 - 20, "Searching Kahoot...", C_TEXT, 2);
+    blit();
     String form = "q=" + urlEncode(stealSearch.c_str()) + "&count=20";
     HttpResp r = http_req("POST", "/api/searchkahoot", form);
     if (r.status != 200) { stealMsg = "Search failed (" + String(r.status) + ")"; return; }
@@ -1139,12 +1266,23 @@ void stealSearchNow(void) {
         nResults++;
     }
     stealMsg = nResults ? "" : "No public quizzes found";
-    for (int i = 0; i < nResults; i++) {
-        String p = "/api/kahootcover?id=" + urlEncode(sUuid[i].c_str())
-                 + "&url=" + urlEncode(sCover[i].c_str()) + "&size=64";
-        bool gif = false;
-        fetchImage565(p, &sCovSpr[i], &sCovW[i], &sCovH[i], &gif);
+}
+
+void drawStealRow(int i) {
+    int ry = 176 + i * 58;
+    glassPanel(16, ry, FB_W - 32, 52, (i % 2) == 0);
+    if (sCovSpr[i]) {
+        int m = sCovW[i] > sCovH[i] ? sCovW[i] : sCovH[i];
+        float sc = 46.0f / m;
+        int dw = sCovW[i] * sc, dh = sCovH[i] * sc;
+        if (dw < 1) dw = 1; if (dh < 1) dh = 1;
+        drawSpriteScaled(22 + (46 - dw) / 2, ry + 3 + (46 - dh) / 2,
+                         sCovSpr[i], sCovW[i], sCovH[i], dw, dh);
+    } else {
+        fillRect(22, ry + 3, 46, 46, C_INK);
+        drawCenteredAt(22 + 23, ry + 18, "?", C_TEXT, 2);
     }
+    drawString(86, ry + 16, sTitle[i].c_str(), C_TEXT, 2);
 }
 
 void drawSteal(void) {
@@ -1157,22 +1295,7 @@ void drawSteal(void) {
     drawCenteredAt(FB_W - 108, 84, "Search", C_INK, 2);
     drawCenteredAt(FB_W - 108, 82, "Search", C_INK, 2);
     drawCentered(150, "Tap a result to steal it", C_FAINT, 1);
-    for (int i = 0; i < nResults && i < 7; i++) {
-        int ry = 176 + i * 58;
-        glassPanel(16, ry, FB_W - 32, 52, (i % 2) == 0);
-        if (sCovSpr[i]) {
-            int m = sCovW[i] > sCovH[i] ? sCovW[i] : sCovH[i];
-            float sc = 46.0f / m;
-            int dw = sCovW[i] * sc, dh = sCovH[i] * sc;
-            if (dw < 1) dw = 1; if (dh < 1) dh = 1;
-            drawSpriteScaled(22 + (46 - dw) / 2, ry + 3 + (46 - dh) / 2,
-                             sCovSpr[i], sCovW[i], sCovH[i], dw, dh);
-        } else {
-            fillRect(22, ry + 3, 46, 46, C_INK);
-            drawCenteredAt(22 + 23, ry + 18, "?", C_TEXT, 2);
-        }
-        drawString(86, ry + 16, sTitle[i].c_str(), C_TEXT, 2);
-    }
+    for (int i = 0; i < nResults && i < 7; i++) drawStealRow(i);
     if (stealMsg.length()) drawCentered(FB_H - 28, stealMsg.c_str(), C_GOLD, 1);
     blit();
 }
@@ -1181,6 +1304,15 @@ void stealLoop(void) {
     stealMsg = "";
     drawSteal();
     while (screen == SCR_STEAL) {
+        // Covers download on the background task; repaint each row as its
+        // cover lands (never while a finger is down).
+        if (!tpActive) {
+            int slot = pumpStealCovers();
+            if (slot >= 0 && slot < 7) {
+                drawStealRow(slot);
+                blitRect(16, 176 + slot * 58, FB_W - 32, 52);
+            }
+        }
         touch_step();
         if (backHit(12, 12, 120, 44) && tapIn(12, 12, 120, 44)) { screen = SCR_MENU; return; }
         if (tapIn(16, 66, FB_W - 230, 60)) {
@@ -1258,6 +1390,7 @@ void setup() {
 
     // touch_gt911_init() initialises I2C and the IO expander internally.
     touch_gt911_init();
+    fetchTaskStart();   // background downloads so touch never blocks
     waveshare_esp32_s3_rgb_lcd_init();
     wavesahre_rgb_lcd_bl_on();
 
