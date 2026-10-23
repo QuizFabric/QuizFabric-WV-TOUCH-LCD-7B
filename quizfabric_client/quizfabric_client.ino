@@ -91,6 +91,25 @@ void drawBackground(void) {
     }
 }
 
+// The same gradient, but only inside one rectangle. Used for partial
+// redraws (the animation drifts so slowly the seam is invisible).
+void drawBackgroundRect(int x, int y, int w, int h) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > FB_W) w = FB_W - x;
+    if (y + h > FB_H) h = FB_H - y;
+    if (w <= 0 || h <= 0) return;
+    float s = sinf(millis() * 0.00035f) * 0.5f + 0.5f;
+    uint16_t topA = RGB(255, 138, 205), botA = RGB(96, 42, 176);
+    uint16_t topB = RGB(255, 106, 173), botB = RGB(70, 30, 150);
+    uint16_t top = lerpColor(topA, topB, s);
+    uint16_t bot = lerpColor(botA, botB, s);
+    for (int yy = y; yy < y + h; yy++) {
+        uint16_t c = lerpColor(top, bot, (float)yy / FB_H);
+        for (int xx = x; xx < x + w; xx++) fb[yy * FB_W + xx] = c;
+    }
+}
+
 void drawRect(int x, int y, int w, int h, uint16_t c) {
     fillRect(x, y, w, 1, c);
     fillRect(x, y + h - 1, w, 1, c);
@@ -184,6 +203,21 @@ int wrapText(const char *s, int maxw, int scale, String *lines, int maxLines) {
 // blit() just flushes the CPU cache so the LCD DMA sees the writes.
 void blit(void) {
     Cache_WriteBack_Addr((uint32_t)fb, FB_W * FB_H * 2);
+}
+
+// Flush only one rectangle to the LCD DMA instead of the whole framebuffer.
+// Cache lines are 64 bytes: align the x down and the width up so we cover
+// the rect (overlapping flushes are harmless).
+void blitRect(int x, int y, int w, int h) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > FB_W) w = FB_W - x;
+    if (y + h > FB_H) h = FB_H - y;
+    if (w <= 0 || h <= 0) return;
+    int ax = x & ~0x3F;
+    int aw = w + (x - ax);
+    for (int yy = y; yy < y + h; yy++)
+        Cache_WriteBack_Addr((uint32_t)(fb + (uint32_t)yy * FB_W + ax), aw * 2);
 }
 
 // Back button (top-left, 3DS-style tile).
@@ -304,25 +338,55 @@ HttpResp http_req(const char *method, const String &path, const String &formData
     // headers
     unsigned long deadline = millis() + 10000;
     int contentLen = -1;
+    bool chunked = false;
     while (c.connected() && millis() < deadline) {
         if (!c.available()) { delay(1); continue; }
         String l = c.readStringUntil('\n');
         if (l.startsWith("HTTP/")) r.status = l.substring(9, 12).toInt();
         if (l.startsWith("Content-Length:")) contentLen = l.substring(15).toInt();
-        if (l == "\r" || l.length() == 1) break;   // blank line = end of headers
+        if (l.startsWith("Transfer-Encoding:") && l.indexOf("chunked") >= 0) chunked = true;
+        if (l == "\r" || l.length() == 0) break;   // blank line (CRLF or LF-only) = end of headers
     }
     // Reserve the body up front: String += without reserve is O(n^2)
     // and freezes the ESP32 for seconds on large quiz JSON.
     if (contentLen > 0) r.body.reserve(contentLen + 1);
     // body: read until the connection closes (or timeout)
     deadline = millis() + 15000;
-    while (millis() < deadline) {
-        if (c.available()) {
-            while (c.available()) r.body += (char)c.read();
-        } else if (!c.connected()) {
-            break;
-        } else {
-            delay(1);
+    if (chunked) {
+        // HTTP chunked encoding: <hex-size>\r\n<data>\r\n ... 0\r\n\r\n
+        bool done = false;
+        while (!done && millis() < deadline) {
+            while (millis() < deadline && !c.available()) {
+                if (!c.connected()) { done = true; break; }
+                delay(1);
+            }
+            if (done || millis() >= deadline || !c.available()) break;
+            String szLine = c.readStringUntil('\n');
+            szLine.trim();
+            long n = strtol(szLine.c_str(), nullptr, 16);
+            if (n <= 0) break;   // 0-size chunk = end (trailers ignored)
+            long got = 0;
+            while (got < n && millis() < deadline) {
+                if (c.available()) { r.body += (char)c.read(); got++; }
+                else if (!c.connected()) break;
+                else delay(1);
+            }
+            // swallow the CRLF after the chunk data
+            while (millis() < deadline) {
+                if (c.available()) { if (c.read() == '\n') break; }
+                else if (!c.connected()) break;
+                else delay(1);
+            }
+        }
+    } else {
+        while (millis() < deadline) {
+            if (c.available()) {
+                while (c.available()) r.body += (char)c.read();
+            } else if (!c.connected()) {
+                break;
+            } else {
+                delay(1);
+            }
         }
     }
     c.stop();
@@ -364,36 +428,44 @@ String keyboard(const char *hint, const char *initial) {
     int cy = baseY + 4 * 72 + 12;
     String lastOut = "\x01";   // force first paint
     bool lastShift = !shift;
+    bool first = true;
     while (true) {
-        // Redraw only when something changed (single-buffered: a full
-        // redraw+blit every frame flickers).
-        if (out != lastOut || shift != lastShift) {
-            lastOut = out;
-            lastShift = shift;
-            drawBackground();
-            glassPanel(20, 16, FB_W - 40, 96, false);
-            drawCentered(30, hint, C_FAINT, 1);
-            drawCentered(62, out.c_str(), C_TEXT, 2);
-
-            for (int r = 0; r < 4; r++) {
-                const char *row = rows[r];
-                int n = strlen(row);
-                int kw = (FB_W - 60) / n;
-                for (int i = 0; i < n; i++) {
-                    int x = 30 + i * kw;
-                    char ch = row[i];
-                    if (r == 0) { if (shift) ch = syms[i]; }
-                    else if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
-                    tile(x, baseY + r * 72, kw - 8, 64, r == 0 ? C_GLASS : ansColor(r));
-                    char b[2] = { ch, 0 };
-                    drawCenteredAt(x + (kw - 8) / 2, baseY + r * 72 + 20, b, C_TEXT, 2);
-                }
+        // Partial refresh: pressing a letter only redraws the text-entry
+        // panel; pressing shift only redraws the keys themselves.
+        bool textCh = out != lastOut;
+        bool shiftCh = shift != lastShift;
+        if (first || textCh || shiftCh) {
+            if (first) { drawBackground(); blit(); }
+            if (first || textCh) {
+                lastOut = out;
+                glassPanel(20, 16, FB_W - 40, 96, false);
+                drawCentered(30, hint, C_FAINT, 1);
+                drawCentered(62, out.c_str(), C_TEXT, 2);
+                blitRect(20, 16, FB_W - 40, 96);
             }
-            tile(30, cy, 230, 64, C_GLASS);       drawCenteredAt(30 + 115, cy + 20, "SPACE", C_TEXT, 2);
-            tile(280, cy, 200, 64, C_GLASS_HI);    drawCenteredAt(280 + 100, cy + 20, shift ? "ABC" : "SHIFT", C_INK, 2);
-            tile(500, cy, 200, 64, C_BAD);         drawCenteredAt(500 + 100, cy + 20, "DEL", C_TEXT, 2);
-            tile(720, cy, 274, 64, C_GOOD);        drawCenteredAt(720 + 137, cy + 20, "DONE", C_INK, 2);
-            blit();
+            if (first || shiftCh) {
+                lastShift = shift;
+                for (int r = 0; r < 4; r++) {
+                    const char *row = rows[r];
+                    int n = strlen(row);
+                    int kw = (FB_W - 60) / n;
+                    for (int i = 0; i < n; i++) {
+                        int x = 30 + i * kw;
+                        char ch = row[i];
+                        if (r == 0) { if (shift) ch = syms[i]; }
+                        else if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
+                        tile(x, baseY + r * 72, kw - 8, 64, r == 0 ? C_GLASS : ansColor(r));
+                        char b[2] = { ch, 0 };
+                        drawCenteredAt(x + (kw - 8) / 2, baseY + r * 72 + 20, b, C_TEXT, 2);
+                    }
+                }
+                tile(30, cy, 230, 64, C_GLASS);       drawCenteredAt(30 + 115, cy + 20, "SPACE", C_TEXT, 2);
+                tile(280, cy, 200, 64, C_GLASS_HI);    drawCenteredAt(280 + 100, cy + 20, shift ? "ABC" : "SHIFT", C_INK, 2);
+                tile(500, cy, 200, 64, C_BAD);         drawCenteredAt(500 + 100, cy + 20, "DEL", C_TEXT, 2);
+                tile(720, cy, 274, 64, C_GOOD);        drawCenteredAt(720 + 137, cy + 20, "DONE", C_INK, 2);
+                blitRect(30, baseY, FB_W - 60, cy + 64 - baseY);
+            }
+            first = false;
         }
 
         touch_step();
@@ -443,10 +515,11 @@ void freeThumbs(void) {
     }
 }
 
-// Load one pending banner thumbnail, one per idle frame. Returns true if
-// something was loaded (caller redraws). Never call this while a finger is
-// down: the fetch is blocking and would make taps freeze.
-bool pumpThumb(void) {
+// Load one pending banner thumbnail, one per idle frame. Returns the slot
+// that got a new thumbnail (caller redraws that row), or -1. Never call
+// this while a finger is down: the fetch is blocking and would make taps
+// freeze.
+int pumpThumb(void) {
     for (int i = 0; i < LIST_ROWS; i++) {
         int qi = listScroll + i;
         if (qi < 0 || qi >= nQuizzes) continue;
@@ -457,11 +530,11 @@ bool pumpThumb(void) {
         String enc = urlEncode(quizNames[qi].c_str());
         if (fetchImage565("/api/quizbanner/" + enc, &s, &w, &h, &gif) && s) {
             thumbSpr[i] = s; thumbW[i] = w; thumbH[i] = h;
-            return true;
+            return i;
         }
-        return false;
+        return -1;
     }
-    return false;
+    return -1;
 }
 
 void fetchQuizList(void) {
@@ -470,7 +543,12 @@ void fetchQuizList(void) {
     HttpResp r = http_req("GET", "/api/quizzes");
     if (r.status != 200) { statusLine = "Could not load the quiz list (" + String(r.status) + ")"; return; }
     JsonDocument doc;
-    if (deserializeJson(doc, r.body)) { statusLine = "Bad quiz list response"; return; }
+    if (deserializeJson(doc, r.body)) {
+        // Show what actually came back so a non-JSON answer (router admin
+        // page, challenge page, ...) is visible on screen.
+        statusLine = "Bad list response: " + r.body.substring(0, 60);
+        return;
+    }
     JsonArray arr = doc["quizzes"];
     for (JsonObject q : arr) {
         if (nQuizzes >= MAX_QUIZZES) break;
@@ -508,27 +586,35 @@ void menuLoop(void) {
 }
 
 // ------------------------------------------------------------------ list
+void drawListRow(int i) {
+    int qi = listScroll + i;
+    int rowY = 84 + i * 62;
+    if (qi >= nQuizzes) return;
+    glassPanel(16, rowY, FB_W - 32, 56, (i % 2) == 0);
+    if (thumbSpr[i]) {
+        float sc = 48.0f / thumbH[i];
+        int dw = thumbW[i] * sc;
+        if (dw > 88) dw = 88;
+        drawSprite(22, rowY + 4, thumbSpr[i], thumbW[i], thumbH[i]);
+    } else {
+        fillRect(22, rowY + 4, 48, 48, C_INK);
+        drawCenteredAt(22 + 24, rowY + 18, "?", C_TEXT, 2);
+    }
+    drawString(90, rowY + 16, quizNames[qi].c_str(), C_TEXT, 2);
+}
+
+// Just the rows area (background under them + rows), no header/back.
+// Callers blitRect the same region.
+void drawListRows(void) {
+    drawBackgroundRect(0, 84, FB_W, LIST_ROWS * 62);
+    for (int i = 0; i < LIST_ROWS; i++) drawListRow(i);
+}
+
 void drawList(void) {
     drawBackground();
     drawCenteredShadow(14, "Choose a quiz", C_TEXT, 2);
     drawCentered(50, "Drag to scroll, tap to play", C_FAINT, 1);
-    int y = 84;
-    for (int i = 0; i < LIST_ROWS; i++) {
-        int qi = listScroll + i;
-        if (qi >= nQuizzes) break;
-        int rowY = y + i * 62;
-        glassPanel(16, rowY, FB_W - 32, 56, (i % 2) == 0);
-        if (thumbSpr[i]) {
-            float sc = 48.0f / thumbH[i];
-            int dw = thumbW[i] * sc;
-            if (dw > 88) dw = 88;
-            drawSprite(22, rowY + 4, thumbSpr[i], thumbW[i], thumbH[i]);
-        } else {
-            fillRect(22, rowY + 4, 48, 48, C_INK);
-            drawCenteredAt(22 + 24, rowY + 18, "?", C_TEXT, 2);
-        }
-        drawString(90, rowY + 16, quizNames[qi].c_str(), C_TEXT, 2);
-    }
+    drawListRows();
     drawBack();
     blit();
 }
@@ -541,7 +627,13 @@ void listLoop(void) {
     while (screen == SCR_LIST) {
         // Load one banner per idle frame. Never during a touch: the HTTP
         // fetch is blocking and was freezing taps.
-        if (!tpActive && pumpThumb()) drawList();
+        if (!tpActive) {
+            int slot = pumpThumb();
+            if (slot >= 0) {
+                drawListRow(slot);
+                blitRect(16, 84 + slot * 62, FB_W - 32, 56);
+            }
+        }
 
         touch_step();
         if (backHit(12, 12, 120, 44) && tapIn(12, 12, 120, 44)) { screen = SCR_MENU; return; }
@@ -563,11 +655,12 @@ void listLoop(void) {
             if (listScroll < 0) listScroll = 0;
             if (listScroll > nQuizzes - LIST_ROWS) listScroll = nQuizzes - LIST_ROWS;
             if (listScroll < 0) listScroll = 0;
-            // Redraw only when the scroll actually moved: a full redraw
-            // every frame while touching tears the single framebuffer.
+            // Redraw only the rows area when the scroll actually moved
+            // (a full redraw every frame tears the single framebuffer).
             if (listScroll != lastScroll) {
                 lastScroll = listScroll;
-                drawList();
+                drawListRows();
+                blitRect(0, 84, FB_W, LIST_ROWS * 62);
             }
         } else if (dragging) {
             dragging = false;
@@ -605,6 +698,8 @@ unsigned long qStart = 0;
 uint16_t *qImgSpr = nullptr;
 int qImgW = 0, qImgH = 0;
 bool qImgGif = false;
+int playControlsY = 150;   // y where the answer controls begin
+bool playNeedsFull = true; // next loop iteration must do a full drawPlay()
 
 void freeQuestionImage(void) {
     if (qImgSpr) { free(qImgSpr); qImgSpr = nullptr; }
@@ -674,6 +769,7 @@ void startQuestion(void) {
         }
     }
     if (q->imgUrl.length()) loadQuestionImage(q->imgUrl);
+    playNeedsFull = true;
 }
 
 void submit(void) {
@@ -697,9 +793,12 @@ void submit(void) {
     }
     if (lastRight) score += lastGain;
     revealing = true;
+    playNeedsFull = true;
 }
 
-void drawPlay(void) {
+// Top half of the play screen: background, header, question, image.
+// Stores where the controls begin in playControlsY.
+void drawPlayTop(void) {
     drawBackground();
     QuizQ *q = &qs[qi];
     char hdr[64];
@@ -729,26 +828,34 @@ void drawPlay(void) {
         drawSprite((FB_W - dw) / 2, y, qImgSpr, qImgW, qImgH);
         y += dh + 8;
     }
+    playControlsY = y;
+}
 
-    if (revealing) {
-        tile(24, y, FB_W - 48, 70, lastRight ? C_GOOD : C_BAD);
-        char txt[80];
-        snprintf(txt, 80, lastRight ? "Correct! +%d" : "Nope", lastGain);
-        drawCenteredShadow(y + 16, txt, C_INK, 2);
-        String correct;
-        if (q->qtype == 0) {
-            for (int k = 0; k < q->nAnswers; k++)
-                if (q->correct[k]) { correct = q->answers[k]; break; }
-        } else if (q->qtype == 1) correct = q->typeAnswer;
-        else if (q->qtype == 2) correct = String(q->sAnswer);
-        else correct = "the listed order";
-        drawCentered(y + 44, String("Answer: " + correct).c_str(), C_INK, 1);
-        tile(24, FB_H - 76, FB_W - 48, 60, C_GOLD);
-        drawCenteredShadow(FB_H - 50, qi + 1 < nQ ? "Next" : "Finish", C_INK, 2);
-        blit();
-        return;
-    }
+// Correct/Nope box + Next button.
+void drawPlayReveal(void) {
+    QuizQ *q = &qs[qi];
+    int y = playControlsY;
+    tile(24, y, FB_W - 48, 70, lastRight ? C_GOOD : C_BAD);
+    char txt[80];
+    snprintf(txt, 80, lastRight ? "Correct! +%d" : "Nope", lastGain);
+    drawCenteredShadow(y + 16, txt, C_INK, 2);
+    String correct;
+    if (q->qtype == 0) {
+        for (int k = 0; k < q->nAnswers; k++)
+            if (q->correct[k]) { correct = q->answers[k]; break; }
+    } else if (q->qtype == 1) correct = q->typeAnswer;
+    else if (q->qtype == 2) correct = String(q->sAnswer);
+    else correct = "the listed order";
+    drawCentered(y + 44, String("Answer: " + correct).c_str(), C_INK, 1);
+    tile(24, FB_H - 76, FB_W - 48, 60, C_GOLD);
+    drawCenteredShadow(FB_H - 50, qi + 1 < nQ ? "Next" : "Finish", C_INK, 2);
+}
 
+// Answer controls only (everything from playControlsY down). Callers
+// blitRect the same region.
+void drawPlayControls(void) {
+    QuizQ *q = &qs[qi];
+    int y = playControlsY;
     int avail = FB_H - 90 - y;
     if (q->qtype == 0) {
         int bh = avail / q->nAnswers;
@@ -761,6 +868,8 @@ void drawPlay(void) {
             tile(24, by, FB_W - 48, bh, selAns == i ? C_GOLD : ansColor(i));
             drawString(40, by + bh / 2 - 8, q->answers[i].c_str(), selAns == i ? C_INK : C_TEXT, 2);
         }
+        tile(24, FB_H - 76, FB_W - 48, 60, C_GOOD);
+        drawCenteredShadow(FB_H - 50, "Submit", C_INK, 2);
     } else if (q->qtype == 1) {
         glassPanel(24, y, FB_W - 48, 70, true);
         drawCentered(y + 16, String("Your answer: " + typed).c_str(), C_TEXT, 2);
@@ -790,6 +899,12 @@ void drawPlay(void) {
         tile(24, FB_H - 76, FB_W - 48, 60, C_GOOD);
         drawCenteredShadow(FB_H - 50, "Submit", C_INK, 2);
     }
+}
+
+void drawPlay(void) {
+    drawPlayTop();
+    if (revealing) drawPlayReveal();
+    else drawPlayControls();
     blit();
 }
 
@@ -804,8 +919,7 @@ void playLoop(void) {
     }
     qi = 0;
     score = 0;
-    startQuestion();
-    drawPlay();   // show the first question right away, not only after a touch
+    startQuestion();   // sets playNeedsFull
     while (screen == SCR_PLAY) {
         touch_step();
         QuizQ *q = &qs[qi];
@@ -814,6 +928,8 @@ void playLoop(void) {
             screen = SCR_MENU;
             return;
         }
+        // Full redraw only when the question (or reveal state) changed.
+        if (playNeedsFull) { drawPlay(); playNeedsFull = false; }
         if (revealing) {
             if (tapIn(24, FB_H - 76, FB_W - 48, 60)) {
                 if (qi + 1 < nQ) { qi++; startQuestion(); }
@@ -824,37 +940,37 @@ void playLoop(void) {
                     return;
                 }
             }
-            drawPlay();
             delay(10);
             continue;
         }
+        int y = playControlsY;
         bool dirty = false;
         if (q->qtype == 0) {
-            int avail = FB_H - 90 - 150;
+            int avail = FB_H - 90 - y;
             int bh = avail / q->nAnswers;
             if (bh > 68) bh = 68;
             int totalH = q->nAnswers * bh + (q->nAnswers - 1) * 8;
-            int ay = 150 + (avail - totalH) / 2;
-            if (ay < 150) ay = 150;
+            int ay = y + (avail - totalH) / 2;
+            if (ay < y) ay = y;
             for (int i = 0; i < q->nAnswers; i++) {
                 int by = ay + i * (bh + 8);
                 if (tapIn(24, by, FB_W - 48, bh)) { selAns = i; dirty = true; }
             }
         } else if (q->qtype == 1) {
-            if (tapIn(24, 150 + 90, FB_W - 48, 60)) { typed = keyboard("Type your answer", typed.c_str()); dirty = true; }
-            if (tapIn(24, 150 + 162, FB_W - 48, 60)) submit();
+            if (tapIn(24, y + 90, FB_W - 48, 60)) { typed = keyboard("Type your answer", typed.c_str()); dirty = true; }
+            if (tapIn(24, y + 162, FB_W - 48, 60)) submit();
         } else if (q->qtype == 2) {
-            if (tpActive && tpX >= 60 && tpX <= FB_W - 60 && tpY >= 150 + 50 && tpY <= 150 + 96) {
+            if (tpActive && tpX >= 60 && tpX <= FB_W - 60 && tpY >= y + 50 && tpY <= y + 96) {
                 float t = (float)(tpX - 60) / (FB_W - 120);
                 sVal = q->sMin + t * (q->sMax - q->sMin);
                 dirty = true;
             }
             if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
         } else if (q->qtype == 3) {
-            int rh = (FB_H - 90 - 150) / q->nAnswers;
+            int rh = (FB_H - 90 - y) / q->nAnswers;
             if (rh > 44) rh = 44;
             for (int i = 1; i < q->nAnswers; i++) {
-                int ry = 150 + i * (rh + 6);
+                int ry = y + i * (rh + 6);
                 if (tapIn(FB_W - 76, ry, 52, rh)) {
                     int t = pOrder[i]; pOrder[i] = pOrder[i - 1]; pOrder[i - 1] = t;
                     dirty = true;
@@ -862,7 +978,11 @@ void playLoop(void) {
             }
             if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
         }
-        if (dirty) drawPlay();
+        // Only the answer controls changed: redraw just that region.
+        if (dirty) {
+            drawPlayControls();
+            blitRect(0, y, FB_W, FB_H - y);
+        }
         delay(10);
     }
 }

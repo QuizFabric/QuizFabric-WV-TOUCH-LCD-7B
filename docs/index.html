@@ -54,7 +54,9 @@
   <pre id="log"></pre>
 
   <script type="module">
-    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js/bundle.js";
+    // Self-hosted, pinned esptool-js 0.4.1 (self-contained ESM bundle).
+    // Pinned + vendored so unpkg updates can never break the flasher.
+    import { ESPLoader, Transport } from "./esptool-js.js";
 
     const logEl = document.getElementById('log');
     let loader = null;
