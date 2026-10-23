@@ -869,12 +869,9 @@ void pollQuestionImage(void) {
     playNeedsFull = true;
 }
 
-bool fetchQuizQuestions(void) {
-    String enc = urlEncode(quizNames[listSel].c_str());
-    HttpResp r = http_req("GET", "/api/quiz/" + enc);
-    if (r.status != 200) return false;
+bool parseQuizQuestions(const String &body) {
     JsonDocument doc;
-    if (deserializeJson(doc, r.body)) return false;
+    if (deserializeJson(doc, body)) return false;
     JsonArray arr = doc.as<JsonArray>();
     nQ = arr.size();
     if (nQ > MAX_Q) nQ = MAX_Q;
@@ -1110,11 +1107,24 @@ void playLoop(void) {
     drawBackground();
     drawCentered(FB_H / 2 - 20, "Loading quiz...", C_TEXT, 2);
     blit();
-    if (!fetchQuizQuestions()) {
-        statusLine = "Could not load that quiz";
-        screen = SCR_MENU;
-        return;
+    // The quiz JSON downloads on the background task too: a synchronous
+    // big download right here made the screen glitch for seconds while
+    // the WiFi bursts fought the LCD DMA.
+    String enc = urlEncode(quizNames[listSel].c_str());
+    uint32_t quizJobId = fetchStart("/api/quiz/" + enc);
+    while (screen == SCR_PLAY && quizJobId) {
+        touch_step();
+        int status = -1;
+        String body;
+        if (!fetchTake(quizJobId, body, &status)) { delay(10); continue; }
+        quizJobId = 0;
+        if (status != 200 || !parseQuizQuestions(body)) {
+            statusLine = "Could not load that quiz";
+            screen = SCR_MENU;
+            return;
+        }
     }
+    if (screen != SCR_PLAY) return;
     qi = 0;
     score = 0;
     startQuestion();   // sets playNeedsFull
@@ -1163,6 +1173,7 @@ void playLoop(void) {
                     blitRect(24, ty, FB_W - 48, th);
                 }
             }
+            if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
         } else if (q->qtype == 1) {
             // The keyboard overwrites the whole screen, so it needs a full
             // redraw on return, not just the controls region.
