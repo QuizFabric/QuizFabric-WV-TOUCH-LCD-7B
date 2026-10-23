@@ -11,6 +11,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include "esp32s3/rom/cache.h"
 #include "rgb_lcd_port.h"
 #include "i2c.h"
@@ -24,6 +25,23 @@ const char *WIFI_PASS = "h2hFnrycpprn";
 
 String SERVER_HOST = "play.lucasgeitgey.com";
 int SERVER_PORT = 80;
+Preferences qfPrefs;
+
+// Loads the saved server address (NVS) once at boot.
+void loadServerPrefs(void) {
+    qfPrefs.begin("quizfabric", true);
+    String h = qfPrefs.getString("host", "");
+    if (h.length()) { SERVER_HOST = h; SERVER_PORT = qfPrefs.getInt("port", 80); }
+    qfPrefs.end();
+}
+
+// Persists the server address after the config screen edits it.
+void saveServerPrefs(void) {
+    qfPrefs.begin("quizfabric", false);
+    qfPrefs.putString("host", SERVER_HOST);
+    qfPrefs.putInt("port", SERVER_PORT);
+    qfPrefs.end();
+}
 
 // ------------------------------------------------------------------ display
 static const int FB_W = EXAMPLE_LCD_H_RES;   // 1024
@@ -282,11 +300,13 @@ bool tapIn(int x, int y, int w, int h) {
 void touch_wait_release(void) { while (touch_gt911_read_point(1).cnt > 0) delay(5); }
 
 // ------------------------------------------------------------------ .565 decode
+// PICA200 8x8 swizzle: PERM[j] = row-major source position stored at
+// output position j (devkitPro tex3ds, matches imgconv.py on the server).
 static const uint8_t PERM[64] = {
-    0, 1, 8, 9, 16, 17, 10, 2, 3, 11, 18, 19, 24, 25, 20, 12,
-    4, 5, 14, 13, 22, 23, 28, 21, 6, 7, 15, 26, 27, 30, 31, 29,
-    32, 33, 40, 41, 48, 49, 42, 34, 35, 43, 50, 51, 56, 57, 52, 44,
-    36, 37, 46, 45, 54, 55, 60, 53, 38, 39, 47, 58, 59, 62, 63, 61
+    0, 1, 8, 9, 2, 3, 10, 11, 16, 17, 24, 25, 18, 19, 26, 27,
+    4, 5, 12, 13, 6, 7, 14, 15, 20, 21, 28, 29, 22, 23, 30, 31,
+    32, 33, 40, 41, 34, 35, 42, 43, 48, 49, 56, 57, 50, 51, 58, 59,
+    36, 37, 44, 45, 38, 39, 46, 47, 52, 53, 60, 61, 54, 55, 62, 63
 };
 static int pow2up(int v) { int p = 8; while (p < v) p <<= 1; return p; }
 
@@ -488,12 +508,24 @@ void fetchTaskFn(void *arg) {
         // Decode .565 payloads HERE on core 0: the per-pixel PERM loop
         // starves the LCD bounce-copy ISR when it runs on the UI core
         // (core 1) and that is what made the screen glitch during and
-        // after image downloads.
+        // after image downloads. Detect .565 by shape (some image URLs
+        // don't end in .565 - banners/covers), never by the path.
         uint16_t *spr = nullptr; int sw = 0, sh = 0; bool isGif = false;
-        if (r.status == 200 && r.body.length() > 6 && p.endsWith(".565")) {
-            if (!decode565((const uint8_t *)r.body.c_str(), r.body.length(), &spr, &sw, &sh))
-                if ((uint8_t)r.body[4] >= 2) isGif = true;
-            r.body = "";   // free the raw body immediately
+        if (r.status == 200 && r.body.length() >= 6) {
+            const uint8_t *d = (const uint8_t *)r.body.c_str();
+            int iw = d[0] | (d[1] << 8);
+            int ih = d[2] | (d[3] << 8);
+            if (iw >= 1 && ih >= 1 && iw <= 1024 && ih <= 1024) {
+                int pw = pow2up(iw), ph = pow2up(ih);
+                size_t fb = (size_t)pw * ph * 4;
+                if (r.body.length() == 4 + fb) {
+                    if (!decode565(d, r.body.length(), &spr, &sw, &sh)) { /* not decodable */ }
+                } else if (r.body.length() >= 6) {
+                    int n = d[4];
+                    if (n >= 2 && r.body.length() == 6 + (size_t)n * fb) isGif = true;
+                }
+            }
+            if (spr || isGif) r.body = "";   // free the raw body immediately
         }
         xSemaphoreTake(fetchLock, portMAX_DELAY);
         if (jid == fetchJobId) {   // not superseded by a newer job
@@ -635,7 +667,7 @@ String keyboard(const char *hint, const char *initial) {
 }
 
 // ------------------------------------------------------------------ screens
-enum Scr { SCR_MENU, SCR_LIST, SCR_PLAY, SCR_STEAL, SCR_CONFIG };
+enum Scr { SCR_MENU, SCR_LIST, SCR_PLAY, SCR_STEAL, SCR_CONFIG, SCR_JOIN };
 Scr screen = SCR_MENU;
 String statusLine = "";
 
@@ -717,12 +749,14 @@ void drawMenu(void) {
     drawBackground();
     drawCenteredShadow(70, "QuizFabric", C_GOLD, 4);
     drawCentered(140, String("Server: " + SERVER_HOST + ":" + String(SERVER_PORT)).c_str(), C_FAINT, 1);
-    tile(80, 220, FB_W - 160, 90, ansColor(0));
-    drawCenteredShadow(252, "Play Solo", C_TEXT, 3);
-    tile(80, 340, FB_W - 160, 90, ansColor(2));
-    drawCenteredShadow(372, "Steal from Kahoot", C_TEXT, 3);
-    glassPanel(80, 460, FB_W - 160, 90, true);
-    drawCentered(496, "Server settings", C_TEXT, 2);
+    tile(80, 190, FB_W - 160, 85, ansColor(0));
+    drawCenteredShadow(220, "Play Solo", C_TEXT, 3);
+    tile(80, 290, FB_W - 160, 85, ansColor(1));
+    drawCenteredShadow(320, "Join game", C_TEXT, 3);
+    tile(80, 390, FB_W - 160, 85, ansColor(2));
+    drawCenteredShadow(420, "Steal from Kahoot", C_TEXT, 3);
+    glassPanel(80, 490, FB_W - 160, 85, true);
+    drawCentered(520, "Server settings", C_TEXT, 2);
     if (statusLine.length()) drawCentered(FB_H - 30, statusLine.c_str(), C_BAD, 1);
     blit();
 }
@@ -731,7 +765,7 @@ void menuLoop(void) {
     drawMenu();
     while (screen == SCR_MENU) {
         touch_step();
-        if (tapIn(80, 220, FB_W - 160, 90)) {
+        if (tapIn(80, 190, FB_W - 160, 85)) {
             // Show feedback immediately so the tap visibly registered,
             // then block on the quiz-list fetch (one-time, at transition).
             drawBackground();
@@ -741,8 +775,9 @@ void menuLoop(void) {
             fetchQuizList();
             return;
         }
-        if (tapIn(80, 340, FB_W - 160, 90)) { screen = SCR_STEAL; return; }
-        if (tapIn(80, 460, FB_W - 160, 90)) { screen = SCR_CONFIG; return; }
+        if (tapIn(80, 290, FB_W - 160, 85)) { screen = SCR_JOIN; return; }
+        if (tapIn(80, 390, FB_W - 160, 85)) { screen = SCR_STEAL; return; }
+        if (tapIn(80, 490, FB_W - 160, 85)) { screen = SCR_CONFIG; return; }
         delay(10);
     }
 }
@@ -1411,7 +1446,8 @@ void configLoop(void) {
     while (screen == SCR_CONFIG) {
         touch_step();
         if (tapIn(80, 240, FB_W - 160, 90)) {
-            String v = keyboard("Server address (host:port)", SERVER_HOST.c_str());
+            String init = SERVER_HOST + ":" + String(SERVER_PORT);
+            String v = keyboard("Server address (host:port)", init.c_str());
             int ci = v.indexOf(':');
             if (ci > 0) {
                 SERVER_HOST = v.substring(0, ci);
@@ -1419,6 +1455,7 @@ void configLoop(void) {
             } else if (v.length()) {
                 SERVER_HOST = v;
             }
+            saveServerPrefs();
             drawBackground();
             drawCenteredShadow(70, "Server settings", C_TEXT, 2);
             drawCentered(150, String("Current: " + SERVER_HOST + ":" + String(SERVER_PORT)).c_str(), C_FAINT, 1);
@@ -1433,10 +1470,468 @@ void configLoop(void) {
     }
 }
 
+// ------------------------------------------------------------------ game join
+// Minimal Engine.IO v4 + Socket.IO v4 client over a plain WebSocket, just
+// enough for QuizFabric's live-game events (join_game / new_question /
+// submit_answer / leaderboard). The Pi's plain-HTTP dispatcher lets the
+// QuizFabric3DS UA through on port 80/5710 including WebSocket upgrades.
+WiFiClient sock;
+String sockSid = "";
+bool sockOpen = false;
+unsigned long sockLastIn = 0;
+static uint32_t wsNeed = 0;
+static uint8_t wsOp = 0;
+static bool wsMasked = false;
+static uint8_t wsMaskKey[4];
+static String wsFrame;
+
+String sioCode = "";
+String sioName = "";
+String sioQuiz = "";
+int sioState = 0;   // 0 idle, 1 lobby, 2 question, 3 submitted, 4 reveal, 5 leaderboard, 6 finished
+String sioMsg = "";
+String sioQText = "";
+String sioAns[8];
+int sioNAns = 0;
+int sioQType = 0;
+float sioMin = 0, sioMax = 100, sioVal = 50;
+int sioSel = -1;
+String sioTyped = "";
+int sioPOrder[8];
+unsigned long sioQStart = 0;
+bool sioRight = false;
+String sioRightAns = "";
+uint32_t sioImgJobId = 0;
+uint16_t *sioImgSpr = nullptr;
+int sioImgW = 0, sioImgH = 0;
+String sioLb[12];
+int sioLbN = 0;
+
+// --- compact SHA1 (for the WebSocket handshake key) ---
+static void sha1(const uint8_t *data, size_t len, uint8_t out[20]) {
+    uint32_t h[5] = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
+    uint64_t bits = (uint64_t)len * 8;
+    size_t plen = ((len + 8) / 64 + 1) * 64;
+    uint8_t *buf = (uint8_t *)malloc(plen);
+    if (!buf) return;
+    memset(buf, 0, plen);
+    memcpy(buf, data, len);
+    buf[len] = 0x80;
+    for (int i = 0; i < 8; i++) buf[plen - 1 - i] = (bits >> (8 * i)) & 0xFF;
+    for (size_t off = 0; off < plen; off += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++)
+            w[i] = ((uint32_t)buf[off + i * 4] << 24) | ((uint32_t)buf[off + i * 4 + 1] << 16)
+                 | ((uint32_t)buf[off + i * 4 + 2] << 8) | buf[off + i * 4 + 3];
+        for (int i = 16; i < 80; i++) {
+            uint32_t v = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+            w[i] = (v << 1) | (v >> 31);
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+            uint32_t t = ((a << 5) | (a >> 27)) + f + e + k + w[i];
+            e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+    free(buf);
+    for (int i = 0; i < 5; i++) {
+        out[i * 4] = h[i] >> 24; out[i * 4 + 1] = h[i] >> 16;
+        out[i * 4 + 2] = h[i] >> 8; out[i * 4 + 3] = h[i];
+    }
+}
+
+static const char B64C[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static void b64encode(const uint8_t *in, size_t n, char *out) {
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = in[i] << 16;
+        if (i + 1 < n) v |= in[i + 1] << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        out[o++] = B64C[(v >> 18) & 63];
+        out[o++] = B64C[(v >> 12) & 63];
+        out[o++] = (i + 1 < n) ? B64C[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < n) ? B64C[v & 63] : '=';
+    }
+    out[o] = 0;
+}
+
+void wsSend(int opcode, const char *data, size_t len) {
+    if (!sockOpen || !sock.connected()) return;
+    uint8_t hdr[14];
+    size_t h = 2;
+    hdr[0] = 0x80 | (opcode & 0x0F);
+    if (len < 126) { hdr[1] = 0x80 | len; }
+    else if (len < 65536) { hdr[1] = 0x80 | 126; hdr[2] = len >> 8; hdr[3] = len & 0xFF; h = 4; }
+    else {
+        hdr[1] = 0x80 | 127;
+        for (int i = 0; i < 8; i++) hdr[2 + i] = ((uint64_t)len >> (56 - 8 * i)) & 0xFF;
+        h = 10;
+    }
+    uint8_t mask[4];
+    for (int i = 0; i < 4; i++) mask[i] = esp_random();
+    memcpy(hdr + h, mask, 4);
+    sock.write(hdr, h + 4);
+    for (size_t i = 0; i < len; i++) sock.write((uint8_t)(data[i] ^ mask[i & 3]));
+    sock.flush();
+}
+
+// Returns one complete WebSocket text frame in out (true) or nothing yet.
+bool wsPoll(String &out) {
+    if (!sockOpen || !sock.connected()) return false;
+    if (wsNeed == 0 && sock.available() >= 2) {
+        int b0 = sock.read(), b1 = sock.read();
+        wsOp = b0 & 0x0F;
+        wsMasked = b1 & 0x80;
+        uint64_t len = b1 & 0x7F;
+        if (len == 126) {
+            if (sock.available() < 2) return false;
+            len = (sock.read() << 8) | sock.read();
+        } else if (len == 127) {
+            if (sock.available() < 8) return false;
+            len = 0;
+            for (int i = 0; i < 8; i++) len = (len << 8) | sock.read();
+        }
+        if (wsMasked) {
+            if (sock.available() < 4) return false;
+            for (int i = 0; i < 4; i++) wsMaskKey[i] = sock.read();
+        }
+        if (len > 200000) { sockOpen = false; return false; }   // sanity
+        wsNeed = len;
+        if (wsOp == 0x8) { sockOpen = false; wsNeed = 0; return false; }
+        wsFrame = "";
+    }
+    if (wsNeed == 0) return false;
+    while (sock.available() && wsNeed > 0) {
+        uint8_t ch = sock.read();
+        if (wsMasked) ch ^= wsMaskKey[wsFrame.length() & 3];
+        wsFrame += (char)ch;
+        wsNeed--;
+    }
+    if (wsNeed > 0) return false;
+    String p = wsFrame;
+    wsFrame = "";
+    if (wsOp == 0x9) { wsSend(0xA, p.c_str(), p.length()); return false; }   // ping -> pong
+    if (wsOp == 0x1 || wsOp == 0x0) { out = p; return true; }
+    return false;
+}
+
+// Process one socket.io message.
+void sioHandle(const String &m) {
+    sockLastIn = millis();
+    if (m == "2") { wsSend(0x1, "3", 1); return; }   // engine ping -> pong
+    if (!m.startsWith("42")) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, m.c_str() + 2)) return;
+    String name = doc[0].as<String>();
+    JsonVariant d = doc[1];
+    if (name == "joined") {
+        sioQuiz = d["quiz_name"].as<String>();
+        sioState = 1;
+        sioMsg = "";
+    } else if (name == "error") {
+        sioMsg = d["message"].as<String>();
+        if (!sioMsg.length()) sioMsg = "Join failed";
+        sioState = 0;
+    } else if (name == "new_question") {
+        sioQText = d["question"].as<String>();
+        sioNAns = 0;
+        for (JsonVariant a : d["answers"].as<JsonArray>()) {
+            if (sioNAns >= 8) break;
+            sioAns[sioNAns++] = a.as<String>();
+        }
+        const char *t = d["type"] | "mc";
+        if (!strcmp(t, "mc")) sioQType = 0;
+        else if (!strcmp(t, "slider")) {
+            sioQType = 2;
+            sioMin = d["min"] | 0.0f;
+            sioMax = d["max"] | 100.0f;
+            sioVal = (sioMin + sioMax) / 2.0f;
+        } else if (!strcmp(t, "puzzle")) {
+            sioQType = 3;
+            for (int i = 0; i < sioNAns; i++) sioPOrder[i] = i;
+        } else sioQType = 1;
+        sioSel = -1;
+        sioTyped = "";
+        sioQStart = millis();
+        sioState = 2;
+        if (sioImgSpr) { free(sioImgSpr); sioImgSpr = nullptr; }
+        sioImgJobId = 0;
+        JsonArray imgs = d["images"].as<JsonArray>();
+        if (imgs.size() > 0) {
+            String u = imgs[0]["url"].as<String>();
+            if (u.length()) sioImgJobId = fetchStart(u + ".565");
+        }
+    } else if (name == "answer_revealed") {
+        sioRight = d["correct"] | false;
+        sioRightAns = d["correct_answer"].as<String>();
+        sioState = 4;
+    } else if (name == "answers_revealed") {
+        sioRightAns = d["correct_answer"].as<String>();
+    } else if (name == "leaderboard") {
+        sioLbN = 0;
+        for (JsonVariant e : d["leaderboard"].as<JsonArray>()) {
+            if (sioLbN >= 12) break;
+            sioLb[sioLbN++] = e["name"].as<String>() + ": " + e["score"].as<String>();
+        }
+        sioRightAns = d["correct_answer"].as<String>();
+        sioState = 5;
+    } else if (name == "final_leaderboard") {
+        sioLbN = 0;
+        for (JsonVariant e : d["leaderboard"].as<JsonArray>()) {
+            if (sioLbN >= 12) break;
+            sioLb[sioLbN++] = e["name"].as<String>() + ": " + e["score"].as<String>();
+        }
+        sioState = 6;
+    }
+}
+
+bool sioConnect(void) {
+    // Engine.IO handshake over polling, then upgrade to a WebSocket.
+    HttpResp r = http_req("GET", "/socket.io/?EIO=4&transport=polling");
+    if (r.status != 200) return false;
+    int ss = r.body.indexOf("\"sid\":\"");
+    if (ss < 0) return false;
+    ss += 7;
+    int se = r.body.indexOf('"', ss);
+    if (se < 0) return false;
+    sockSid = r.body.substring(ss, se);
+    if (!sock.connect(SERVER_HOST.c_str(), SERVER_PORT)) return false;
+    sock.setTimeout(10000);
+    uint8_t key[16];
+    for (int i = 0; i < 16; i++) key[i] = esp_random();
+    char kb64[32];
+    b64encode(key, 16, kb64);
+    String req = "GET /socket.io/?EIO=4&transport=websocket&sid=" + sockSid
+               + " HTTP/1.1\r\nHost: " + SERVER_HOST
+               + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + kb64
+               + "\r\nSec-WebSocket-Version: 13\r\nUser-Agent: QuizFabric3DS-ESP32\r\n\r\n";
+    sock.print(req);
+    String head;
+    unsigned long dl = millis() + 10000;
+    while (millis() < dl && head.indexOf("\r\n\r\n") < 0) {
+        if (sock.available()) head += (char)sock.read();
+        else delay(1);
+    }
+    if (head.indexOf("101") < 0) { sock.stop(); return false; }
+    sockOpen = true;
+    sockLastIn = millis();
+    wsFrame = ""; wsNeed = 0;
+    wsSend(0x1, "40", 2);   // socket.io namespace open
+    return true;
+}
+
+void sioSubmit(const String &answerJson) {
+    float secs = (millis() - sioQStart) / 1000.0f;
+    String ev = "42[\"submit_answer\",{\"code\":\"" + sioCode + "\",\"answer\":"
+              + answerJson + ",\"time_taken\":" + String(secs, 1) + "}]";
+    wsSend(0x1, ev.c_str(), ev.length());
+    sioState = 3;
+}
+
+void drawJoin(void) {
+    drawBackground();
+    drawCentered(14, String("Game " + sioCode).c_str(), C_FAINT, 1);
+    drawBack();
+    if (sioState <= 1) {
+        drawCentered(120, sioQuiz.length() ? String("Quiz: " + sioQuiz).c_str() : "Joining game...", C_TEXT, 2);
+        drawCentered(180, "Waiting for the host to start...", C_FAINT, 1);
+        if (sioMsg.length()) drawCentered(240, sioMsg.c_str(), C_BAD, 1);
+        blit();
+        return;
+    }
+    if (sioState == 3) {
+        drawCentered(FB_H / 2 - 10, "Answer sent - waiting for others...", C_TEXT, 2);
+        blit();
+        return;
+    }
+    if (sioState == 4) {
+        tile(24, 200, FB_W - 48, 120, sioRight ? C_GOOD : C_BAD);
+        drawCenteredShadow(228, sioRight ? "Correct!" : "Nope", C_INK, 2);
+        drawCentered(280, String("Answer: " + sioRightAns).c_str(), C_INK, 2);
+        blit();
+        return;
+    }
+    if (sioState == 5 || sioState == 6) {
+        drawCenteredShadow(100, sioState == 6 ? "Final scores" : "Leaderboard", C_TEXT, 2);
+        for (int i = 0; i < sioLbN; i++) {
+            glassPanel(80, 140 + i * 36, FB_W - 160, 32, (i % 2) == 0);
+            drawString(100, 140 + i * 36 + 10, sioLb[i].c_str(), C_TEXT, 2);
+        }
+        if (sioState == 5) drawCentered(FB_H - 30, String("Answer: " + sioRightAns).c_str(), C_FAINT, 1);
+        blit();
+        return;
+    }
+    // state 2: live question
+    int y = 66;
+    String lines[3];
+    int nl = wrapText(sioQText.c_str(), FB_W - 48, 2, lines, 3);
+    for (int i = 0; i < nl; i++) { drawString(24, y, lines[i].c_str(), C_TEXT, 2); y += 22; }
+    y += 4;
+    if (sioImgSpr) {
+        float sc = 1.0f;
+        int maxw = FB_W - 48, maxh = 120;
+        if (sioImgW > maxw) sc = (float)maxw / sioImgW;
+        if (sioImgH * sc > maxh) sc = (float)maxh / sioImgH;
+        int dw = sioImgW * sc, dh = sioImgH * sc;
+        if (dw < 1) dw = 1; if (dh < 1) dh = 1;
+        drawSpriteScaled((FB_W - dw) / 2, y, sioImgSpr, sioImgW, sioImgH, dw, dh);
+        y += dh + 6;
+    }
+    int cy = y;
+    if (sioQType == 0) {
+        int avail = FB_H - 80 - cy;
+        int bh = avail / sioNAns;
+        if (bh > 64) bh = 64;
+        int totalH = sioNAns * bh + (sioNAns - 1) * 6;
+        while (totalH > avail && bh > 12) { bh--; totalH = sioNAns * bh + (sioNAns - 1) * 6; }
+        int ay = cy + (avail - totalH) / 2;
+        if (ay < cy) ay = cy;
+        for (int i = 0; i < sioNAns; i++) {
+            int by = ay + i * (bh + 6);
+            tile(24, by, FB_W - 48, bh, sioSel == i ? C_GOLD : ansColor(i));
+            drawString(40, by + bh / 2 - 8, sioAns[i].c_str(), sioSel == i ? C_INK : C_TEXT, 2);
+        }
+    } else if (sioQType == 2) {
+        char txt[48];
+        snprintf(txt, 48, "%.1f    (%.1f - %.1f)", sioVal, sioMin, sioMax);
+        drawCentered(cy + 8, txt, C_TEXT, 2);
+        glassPanel(60, cy + 50, FB_W - 120, 46, false);
+        float t = (sioMax > sioMin) ? (sioVal - sioMin) / (sioMax - sioMin) : 0.0f;
+        fillRect(60, cy + 50, (FB_W - 120) * t, 46, C_GOLD);
+        tile(24, FB_H - 90, FB_W - 48, 60, C_GOOD);
+        drawCenteredShadow(FB_H - 64, "Send", C_INK, 2);
+    } else if (sioQType == 3) {
+        for (int i = 0; i < sioNAns; i++) {
+            int ry = cy + i * 46;
+            tile(24, ry, FB_W - 110, 40, ansColor(i));
+            drawString(40, ry + 12, sioAns[sioPOrder[i]].c_str(), C_TEXT, 2);
+            glassPanel(FB_W - 76, ry, 52, 40, true);
+            drawCenteredAt(FB_W - 50, ry + 12, "^", C_TEXT, 2);
+        }
+        tile(24, FB_H - 90, FB_W - 48, 60, C_GOOD);
+        drawCenteredShadow(FB_H - 64, "Send", C_INK, 2);
+    } else {
+        drawCentered(cy + 10, String("Your answer: " + sioTyped).c_str(), C_TEXT, 2);
+        tile(24, cy + 60, FB_W - 48, 60, ansColor(3));
+        drawCenteredShadow(cy + 76, "Type answer", C_INK, 2);
+        tile(24, FB_H - 90, FB_W - 48, 60, C_GOOD);
+        drawCenteredShadow(FB_H - 64, "Send", C_INK, 2);
+    }
+    blit();
+}
+
+void joinLoop(void) {
+    sioState = 0;
+    sioMsg = "";
+    sioQuiz = "";
+    if (sioImgSpr) { free(sioImgSpr); sioImgSpr = nullptr; }
+    sioImgJobId = 0;
+    String code = keyboard("Enter the game code", sioCode.c_str());
+    if (!code.length()) { screen = SCR_MENU; return; }
+    sioCode = code;
+    String name = keyboard("Enter your name", sioName.length() ? sioName.c_str() : "ESP32");
+    if (!name.length()) { screen = SCR_MENU; return; }
+    sioName = name;
+
+    drawBackground();
+    drawCentered(FB_H / 2 - 20, "Joining game...", C_TEXT, 2);
+    blit();
+    if (!sioConnect()) { sioMsg = "Could not connect to the game"; sioState = 0; }
+    else {
+        String ev = "42[\"join_game\",{\"code\":\"" + sioCode + "\",\"name\":\"" + sioName + "\",\"avatar\":\"\"}]";
+        wsSend(0x1, ev.c_str(), ev.length());
+    }
+
+    while (screen == SCR_JOIN) {
+        touch_step();
+        if (backHit(12, 12, 120, 44) && tapIn(12, 12, 120, 44)) {
+            sockOpen = false;
+            sock.stop();
+            screen = SCR_MENU;
+            return;
+        }
+        String out;
+        while (wsPoll(out)) sioHandle(out);
+        if (sockOpen && millis() - sockLastIn > 60000) { sockOpen = false; sioMsg = "Connection lost"; sioState = 0; }
+        if (sioImgJobId) {
+            int status = -1;
+            uint16_t *s = nullptr; int w = 0, h = 0; bool gif = false;
+            if (fetchTakeSprite(sioImgJobId, &status, &s, &w, &h, &gif)) {
+                sioImgJobId = 0;
+                if (s) { sioImgSpr = s; sioImgW = w; sioImgH = h; }
+            }
+        }
+        if (sioState == 2) {
+            int cy = 66;
+            String lines[3];
+            int nl = wrapText(sioQText.c_str(), FB_W - 48, 2, lines, 3);
+            cy += nl * 22 + 4;
+            if (sioImgSpr) {
+                float sc = 1.0f;
+                if (sioImgW > FB_W - 48) sc = (float)(FB_W - 48) / sioImgW;
+                if (sioImgH * sc > 120) sc = 120.0f / sioImgH;
+                cy += (int)(sioImgH * sc) + 6;
+            }
+            if (sioQType == 0) {
+                int avail = FB_H - 80 - cy;
+                int bh = avail / sioNAns;
+                if (bh > 64) bh = 64;
+                int totalH = sioNAns * bh + (sioNAns - 1) * 6;
+                while (totalH > avail && bh > 12) { bh--; totalH = sioNAns * bh + (sioNAns - 1) * 6; }
+                int ay = cy + (avail - totalH) / 2;
+                if (ay < cy) ay = cy;
+                for (int i = 0; i < sioNAns; i++) {
+                    int by = ay + i * (bh + 6);
+                    if (tapIn(24, by, FB_W - 48, bh)) {
+                        sioSel = i;
+                        sioSubmit(String(i));   // tap = answer, Kahoot style
+                    }
+                }
+            } else if (sioQType == 2) {
+                if (tpActive && tpX >= 60 && tpX <= FB_W - 60 && tpY >= cy + 50 && tpY <= cy + 96) {
+                    float t = (float)(tpX - 60) / (FB_W - 120);
+                    sioVal = sioMin + t * (sioMax - sioMin);
+                    drawJoin();
+                }
+                if (tapIn(24, FB_H - 90, FB_W - 48, 60)) sioSubmit(String(sioVal, 1));
+            } else if (sioQType == 3) {
+                for (int i = 1; i < sioNAns; i++) {
+                    int ry = cy + i * 46;
+                    if (tapIn(FB_W - 76, ry, 52, 40)) {
+                        int t = sioPOrder[i]; sioPOrder[i] = sioPOrder[i - 1]; sioPOrder[i - 1] = t;
+                        drawJoin();
+                    }
+                }
+                if (tapIn(24, FB_H - 90, FB_W - 48, 60)) {
+                    String list = "[";
+                    for (int i = 0; i < sioNAns; i++) {
+                        if (i) list += ",";
+                        list += "\"" + sioAns[sioPOrder[i]] + "\"";
+                    }
+                    list += "]";
+                    sioSubmit(list);
+                }
+            } else {
+                if (tapIn(24, cy + 60, FB_W - 48, 60)) { sioTyped = keyboard("Type your answer", sioTyped.c_str()); drawJoin(); }
+                if (tapIn(24, FB_H - 90, FB_W - 48, 60) && sioTyped.length()) sioSubmit("\"" + sioTyped + "\"");
+            }
+        }
+        drawJoin();
+        delay(10);
+    }
+}
+
 // ------------------------------------------------------------------ setup/loop
 void setup() {
     Serial.begin(115200);
     randomSeed(analogRead(0) + millis());
+    loadServerPrefs();   // saved server address from NVS
 
     // touch_gt911_init() initialises I2C and the IO expander internally.
     touch_gt911_init();
@@ -1473,6 +1968,7 @@ void loop() {
         case SCR_PLAY: playLoop(); break;
         case SCR_STEAL: stealLoop(); break;
         case SCR_CONFIG: configLoop(); break;
+        case SCR_JOIN: joinLoop(); break;
     }
     delay(10);
 }
