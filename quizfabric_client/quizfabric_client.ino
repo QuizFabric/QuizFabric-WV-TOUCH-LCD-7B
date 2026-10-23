@@ -312,6 +312,20 @@ void drawSprite(int x, int y, const uint16_t *spr, int w, int h) {
     }
 }
 
+// Sprite scaled to exactly dw x dh (nearest neighbour). Sprites must fit
+// their box: drawing at full size bleeds over neighbouring rows.
+void drawSpriteScaled(int x, int y, const uint16_t *spr, int w, int h, int dw, int dh) {
+    for (int yy = 0; yy < dh; yy++) {
+        if (y + yy < 0 || y + yy >= FB_H) continue;
+        int sy = (int)((long)yy * h / dh);
+        for (int xx = 0; xx < dw; xx++) {
+            if (x + xx < 0 || x + xx >= FB_W) continue;
+            int sx = (int)((long)xx * w / dw);
+            fb[(y + yy) * FB_W + (x + xx)] = spr[sy * w + sx];
+        }
+    }
+}
+
 // ------------------------------------------------------------------ HTTP
 struct HttpResp { int status; String body; };
 
@@ -592,10 +606,14 @@ void drawListRow(int i) {
     if (qi >= nQuizzes) return;
     glassPanel(16, rowY, FB_W - 32, 56, (i % 2) == 0);
     if (thumbSpr[i]) {
-        float sc = 48.0f / thumbH[i];
-        int dw = thumbW[i] * sc;
-        if (dw > 88) dw = 88;
-        drawSprite(22, rowY + 4, thumbSpr[i], thumbW[i], thumbH[i]);
+        // Fit the banner inside the 48x48 box, centred, so it can never
+        // bleed over the neighbouring rows.
+        int m = thumbW[i] > thumbH[i] ? thumbW[i] : thumbH[i];
+        float sc = 48.0f / m;
+        int dw = thumbW[i] * sc, dh = thumbH[i] * sc;
+        if (dw < 1) dw = 1; if (dh < 1) dh = 1;
+        drawSpriteScaled(22 + (48 - dw) / 2, rowY + 4 + (48 - dh) / 2,
+                         thumbSpr[i], thumbW[i], thumbH[i], dw, dh);
     } else {
         fillRect(22, rowY + 4, 48, 48, C_INK);
         drawCenteredAt(22 + 24, rowY + 18, "?", C_TEXT, 2);
@@ -624,14 +642,27 @@ void listLoop(void) {
     bool dragging = false;
     int dragStartY = 0;
     int lastScroll = listScroll;
+    unsigned long lastPaintMs = 0;
+    bool thumbDirty = false;
     while (screen == SCR_LIST) {
-        // Load one banner per idle frame. Never during a touch: the HTTP
-        // fetch is blocking and was freezing taps.
+        // Load banners one per idle frame (never during a touch: the HTTP
+        // fetch is blocking and was freezing taps). Repaint the rows only
+        // once all visible banners are in, so the list doesn't strobe
+        // row-by-row while the LCD scans the framebuffer.
         if (!tpActive) {
-            int slot = pumpThumb();
-            if (slot >= 0) {
-                drawListRow(slot);
-                blitRect(16, 84 + slot * 62, FB_W - 32, 56);
+            if (pumpThumb() >= 0) thumbDirty = true;
+            if (thumbDirty) {
+                bool pending = false;
+                for (int i = 0; i < LIST_ROWS; i++) {
+                    int qi = listScroll + i;
+                    if (qi >= 0 && qi < nQuizzes && quizHasBanner[qi] && !thumbSpr[i] && thumbFor[i] != qi)
+                        { pending = true; break; }
+                }
+                if (!pending) {
+                    drawListRows();
+                    blitRect(0, 84, FB_W, LIST_ROWS * 62);
+                    thumbDirty = false;
+                }
             }
         }
 
@@ -655,12 +686,14 @@ void listLoop(void) {
             if (listScroll < 0) listScroll = 0;
             if (listScroll > nQuizzes - LIST_ROWS) listScroll = nQuizzes - LIST_ROWS;
             if (listScroll < 0) listScroll = 0;
-            // Redraw only the rows area when the scroll actually moved
-            // (a full redraw every frame tears the single framebuffer).
-            if (listScroll != lastScroll) {
+            // Redraw the rows only when the scroll moved AND at most every
+            // 50ms - fast repaints while dragging tear the framebuffer.
+            if (listScroll != lastScroll && millis() - lastPaintMs >= 50) {
                 lastScroll = listScroll;
+                lastPaintMs = millis();
                 drawListRows();
                 blitRect(0, 84, FB_W, LIST_ROWS * 62);
+                thumbDirty = false;
             }
         } else if (dragging) {
             dragging = false;
@@ -825,7 +858,8 @@ void drawPlayTop(void) {
         if (qImgW > maxw) sc = (float)maxw / qImgW;
         if (qImgH * sc > maxh) sc = (float)maxh / qImgH;
         int dw = qImgW * sc, dh = qImgH * sc;
-        drawSprite((FB_W - dw) / 2, y, qImgSpr, qImgW, qImgH);
+        if (dw < 1) dw = 1; if (dh < 1) dh = 1;
+        drawSpriteScaled((FB_W - dw) / 2, y, qImgSpr, qImgW, qImgH, dw, dh);
         y += dh + 8;
     }
     playControlsY = y;
@@ -957,7 +991,9 @@ void playLoop(void) {
                 if (tapIn(24, by, FB_W - 48, bh)) { selAns = i; dirty = true; }
             }
         } else if (q->qtype == 1) {
-            if (tapIn(24, y + 90, FB_W - 48, 60)) { typed = keyboard("Type your answer", typed.c_str()); dirty = true; }
+            // The keyboard overwrites the whole screen, so it needs a full
+            // redraw on return, not just the controls region.
+            if (tapIn(24, y + 90, FB_W - 48, 60)) { typed = keyboard("Type your answer", typed.c_str()); playNeedsFull = true; }
             if (tapIn(24, y + 162, FB_W - 48, 60)) submit();
         } else if (q->qtype == 2) {
             if (tpActive && tpX >= 60 && tpX <= FB_W - 60 && tpY >= y + 50 && tpY <= y + 96) {
@@ -1039,10 +1075,12 @@ void drawSteal(void) {
         int ry = 176 + i * 58;
         glassPanel(16, ry, FB_W - 32, 52, (i % 2) == 0);
         if (sCovSpr[i]) {
-            float sc = 46.0f / sCovH[i];
-            int dw = sCovW[i] * sc;
-            if (dw > 70) dw = 70;
-            drawSprite(22, ry + 3, sCovSpr[i], sCovW[i], sCovH[i]);
+            int m = sCovW[i] > sCovH[i] ? sCovW[i] : sCovH[i];
+            float sc = 46.0f / m;
+            int dw = sCovW[i] * sc, dh = sCovH[i] * sc;
+            if (dw < 1) dw = 1; if (dh < 1) dh = 1;
+            drawSpriteScaled(22 + (46 - dw) / 2, ry + 3 + (46 - dh) / 2,
+                             sCovSpr[i], sCovW[i], sCovH[i], dw, dh);
         } else {
             fillRect(22, ry + 3, 46, 46, C_INK);
             drawCenteredAt(22 + 23, ry + 18, "?", C_TEXT, 2);
