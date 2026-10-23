@@ -170,7 +170,7 @@ void wavesahre_rgb_lcd_display(uint8_t *Image)
 
 void waveshare_get_frame_buffer(void **buf1, void **buf2)
 {
-    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 2, buf1, buf2));
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, EXAMPLE_LCD_RGB_BUFFER_NUMS, buf1, buf2));
 }
 /**
  * @brief Turn on the RGB LCD screen backlight.

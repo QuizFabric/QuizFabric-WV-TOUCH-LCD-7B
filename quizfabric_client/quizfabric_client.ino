@@ -11,6 +11,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
+#include "esp32s3/rom/cache.h"
 #include "rgb_lcd_port.h"
 #include "i2c.h"
 #include "io_extension.h"
@@ -173,7 +174,12 @@ int wrapText(const char *s, int maxw, int scale, String *lines, int maxLines) {
     return n;
 }
 
-void blit(void) { wavesahre_rgb_lcd_display((uint8_t *)fb); }
+// Single-buffered rendering: fb IS the panel's framebuffer (the RGB
+// controller scans it continuously), so drawing is immediately visible.
+// blit() just flushes the CPU cache so the LCD DMA sees the writes.
+void blit(void) {
+    Cache_WriteBack_Addr((uint32_t)fb, FB_W * FB_H * 2);
+}
 
 // Back button (top-left, 3DS-style tile).
 bool backHit(int x, int y, int w, int h) {
@@ -977,7 +983,9 @@ void setup() {
     waveshare_esp32_s3_rgb_lcd_init();
     wavesahre_rgb_lcd_bl_on();
 
-    fb = (uint16_t *)heap_caps_malloc(FB_W * FB_H * 2, MALLOC_CAP_SPIRAM);
+    void *fb1 = nullptr, *fb2 = nullptr;
+    waveshare_get_frame_buffer(&fb1, &fb2);
+    fb = (uint16_t *)fb1;
     memset(fb, 0, FB_W * FB_H * 2);
 
     drawBackground();
