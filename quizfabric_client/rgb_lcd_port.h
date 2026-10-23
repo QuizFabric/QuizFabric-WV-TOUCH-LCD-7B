@@ -42,11 +42,8 @@
 #define EXAMPLE_LCD_BIT_PER_PIXEL       (16)   ///< Bits per pixel (color depth)
 #define EXAMPLE_RGB_BIT_PER_PIXEL       (16)   ///< RGB interface color depth
 #define EXAMPLE_RGB_DATA_WIDTH          (16)   ///< Data width for RGB interface
-#define EXAMPLE_LCD_RGB_BUFFER_NUMS     (1)    ///< Number of frame buffers for double buffering
-// Must divide FB_H (600) evenly - the driver rejects sizes that are not
-// exact multiples of the framebuffer (45 lines = boot loop). 50 lines is
-// the largest safe divisor and gives the ISR the most headroom.
-#define EXAMPLE_RGB_BOUNCE_BUFFER_SIZE  (EXAMPLE_LCD_H_RES * 50) ///< Size of bounce buffer for RGB data
+#define EXAMPLE_LCD_RGB_BUFFER_NUMS     (2)    ///< Number of frame buffers for double buffering
+#define EXAMPLE_RGB_BOUNCE_BUFFER_SIZE  (EXAMPLE_LCD_H_RES * 10) ///< Size of bounce buffer for RGB data
 
 /**
  * @brief GPIO Pins for RGB LCD Signals

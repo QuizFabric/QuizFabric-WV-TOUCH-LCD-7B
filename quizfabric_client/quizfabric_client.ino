@@ -226,26 +226,38 @@ int wrapText(const char *s, int maxw, int scale, String *lines, int maxLines) {
     return n;
 }
 
-// Single-buffered rendering: fb IS the panel's framebuffer (the RGB
-// controller scans it continuously), so drawing is immediately visible.
-// blit() just flushes the CPU cache so the LCD DMA sees the writes.
+// Double-buffered rendering: we draw into whichever of the driver's two
+// framebuffers is NOT being streamed to the LCD, then hand it to the
+// driver (esp_lcd_panel_draw_bitmap) which switches to it at the next
+// frame. No cache writeback needed - the bounce ISR reads through the
+// same cache. This is the tear-free path; the old single-buffer scheme
+// raced the scanout and caused the frame rolls.
+static uint16_t *fbA = nullptr;
+static uint16_t *fbB = nullptr;
+
+static uint16_t *fbOther(void) { return (fb == fbA) ? fbB : fbA; }
+
 void blit(void) {
-    Cache_WriteBack_Addr((uint32_t)fb, FB_W * FB_H * 2);
+    wavesahre_rgb_lcd_display((uint8_t *)fb);   // show what we just drew
+    // Bring the other buffer up to date too, so later partial updates
+    // can be mirrored into it and it never shows stale pixels.
+    memcpy(fbOther(), fb, FB_W * FB_H * 2);
+    fb = fbOther();   // draw into the non-displayed buffer from now on
 }
 
-// Flush only one rectangle to the LCD DMA instead of the whole framebuffer.
-// Cache lines are 64 bytes: align the x down and the width up so we cover
-// the rect (overlapping flushes are harmless).
+// The caller just drew a rectangle into fb: mirror it into the other
+// buffer and switch which buffer is being displayed.
 void blitRect(int x, int y, int w, int h) {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > FB_W) w = FB_W - x;
     if (y + h > FB_H) h = FB_H - y;
     if (w <= 0 || h <= 0) return;
-    int ax = x & ~0x3F;
-    int aw = w + (x - ax);
+    uint16_t *oth = fbOther();
     for (int yy = y; yy < y + h; yy++)
-        Cache_WriteBack_Addr((uint32_t)(fb + (uint32_t)yy * FB_W + ax), aw * 2);
+        memcpy(oth + yy * FB_W + x, fb + yy * FB_W + x, w * 2);
+    wavesahre_rgb_lcd_display((uint8_t *)fb);
+    fb = oth;
 }
 
 // Back button (top-left, 3DS-style tile).
@@ -1945,8 +1957,11 @@ void setup() {
 
     void *fb1 = nullptr, *fb2 = nullptr;
     waveshare_get_frame_buffer(&fb1, &fb2);
-    fb = (uint16_t *)fb1;
-    memset(fb, 0, FB_W * FB_H * 2);
+    fbA = (uint16_t *)fb1;
+    fbB = (uint16_t *)fb2;
+    memset(fbA, 0, FB_W * FB_H * 2);
+    memset(fbB, 0, FB_W * FB_H * 2);
+    fb = fbB;   // draw into B first; the first blit() puts it on screen
     Serial.println("boot: framebuffer ok");
 
     drawBackground();
