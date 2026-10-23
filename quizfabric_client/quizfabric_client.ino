@@ -349,53 +349,77 @@ HttpResp http_req(const char *method, const String &path, const String &formData
     } else {
         c.print("\r\n");
     }
-    // headers
+    // headers: read a raw byte stream until the full header terminator
+    // shows up. NEVER use c.connected() to end this loop - on lwIP the
+    // peer's FIN can arrive while response bytes are still buffered, and
+    // through some NATs the FIN precedes the last header burst. That
+    // race made the body start with leftover headers ("Content-Length:
+    // 586 Date: ...") and broke the quiz list over the domain path.
+    String head;
     unsigned long deadline = millis() + 10000;
+    int sep = -1;
+    while (millis() < deadline && sep < 0) {
+        if (c.available()) {
+            head += (char)c.read();
+            sep = head.indexOf("\r\n\r\n");
+            if (sep < 0) sep = head.indexOf("\n\n");
+        } else {
+            delay(1);
+        }
+    }
     int contentLen = -1;
     bool chunked = false;
-    while (c.connected() && millis() < deadline) {
-        if (!c.available()) { delay(1); continue; }
-        String l = c.readStringUntil('\n');
-        if (l.startsWith("HTTP/")) r.status = l.substring(9, 12).toInt();
-        if (l.startsWith("Content-Length:")) contentLen = l.substring(15).toInt();
-        if (l.startsWith("Transfer-Encoding:") && l.indexOf("chunked") >= 0) chunked = true;
-        if (l == "\r" || l.length() == 0) break;   // blank line (CRLF or LF-only) = end of headers
+    if (sep >= 0) {
+        int ls = 0;
+        while (ls < sep) {
+            int nl = head.indexOf('\n', ls);
+            if (nl < 0 || nl > sep) nl = sep;
+            String l = head.substring(ls, nl);
+            l.trim();
+            if (l.startsWith("HTTP/")) r.status = l.substring(9, 12).toInt();
+            if (l.startsWith("Content-Length:")) contentLen = l.substring(15).toInt();
+            if (l.startsWith("Transfer-Encoding:") && l.indexOf("chunked") >= 0) chunked = true;
+            ls = nl + 1;
+        }
+        int bodyStart = sep + 4;
+        if (head.substring(sep, sep + 2) == "\n\n") bodyStart = sep + 2;
+        r.body = head.substring(bodyStart);   // anything that already arrived
     }
     // Reserve the body up front: String += without reserve is O(n^2)
     // and freezes the ESP32 for seconds on large quiz JSON.
     if (contentLen > 0) r.body.reserve(contentLen + 1);
-    // body: read until the connection closes (or timeout)
+    // drain the rest of the body
     deadline = millis() + 15000;
     if (chunked) {
-        // HTTP chunked encoding: <hex-size>\r\n<data>\r\n ... 0\r\n\r\n
-        bool done = false;
-        while (!done && millis() < deadline) {
-            while (millis() < deadline && !c.available()) {
-                if (!c.connected()) { done = true; break; }
-                delay(1);
-            }
-            if (done || millis() >= deadline || !c.available()) break;
-            String szLine = c.readStringUntil('\n');
-            szLine.trim();
-            long n = strtol(szLine.c_str(), nullptr, 16);
-            if (n <= 0) break;   // 0-size chunk = end (trailers ignored)
-            long got = 0;
-            while (got < n && millis() < deadline) {
-                if (c.available()) { r.body += (char)c.read(); got++; }
-                else if (!c.connected()) break;
-                else delay(1);
-            }
-            // swallow the CRLF after the chunk data
-            while (millis() < deadline) {
-                if (c.available()) { if (c.read() == '\n') break; }
-                else if (!c.connected()) break;
-                else delay(1);
-            }
+        while (millis() < deadline) {
+            if (c.available()) {
+                while (c.available()) r.body += (char)c.read();
+            } else if (!c.connected()) break;
+            else delay(1);
         }
+        // decode the chunk framing from the raw body
+        String decoded;
+        decoded.reserve(r.body.length());
+        int pos = 0;
+        while (pos + 1 < (int)r.body.length()) {
+            int nl = r.body.indexOf('\n', pos);
+            if (nl < 0) break;
+            long n = strtol(r.body.substring(pos, nl).c_str(), nullptr, 16);
+            pos = nl + 1;
+            if (n <= 0) break;   // 0-size chunk = end
+            if (pos + n > (int)r.body.length()) n = r.body.length() - pos;
+            decoded += r.body.substring(pos, pos + n);
+            pos += n;
+            if (pos < (int)r.body.length() && r.body[pos] == '\r') pos++;
+            if (pos < (int)r.body.length() && r.body[pos] == '\n') pos++;
+        }
+        r.body = decoded;
     } else {
         while (millis() < deadline) {
             if (c.available()) {
                 while (c.available()) r.body += (char)c.read();
+            } else if (contentLen >= 0 && (int)r.body.length() >= contentLen) {
+                break;   // got everything the server promised
             } else if (!c.connected()) {
                 break;
             } else {
@@ -885,23 +909,67 @@ void drawPlayReveal(void) {
     drawCenteredShadow(FB_H - 50, qi + 1 < nQ ? "Next" : "Finish", C_INK, 2);
 }
 
+// Geometry for one mc answer tile (shared by drawing and tap handling).
+void mcTileRect(int i, int *ty, int *th) {
+    QuizQ *q = &qs[qi];
+    int avail = FB_H - 90 - playControlsY;
+    int bh = avail / q->nAnswers;
+    if (bh > 68) bh = 68;
+    int totalH = q->nAnswers * bh + (q->nAnswers - 1) * 8;
+    int ay = playControlsY + (avail - totalH) / 2;
+    if (ay < playControlsY) ay = playControlsY;
+    *ty = ay + i * (bh + 8);
+    *th = bh;
+}
+
+// Draw one mc answer tile, no blit (caller flushes).
+void drawMcTileOnly(int i) {
+    QuizQ *q = &qs[qi];
+    int ty, th;
+    mcTileRect(i, &ty, &th);
+    tile(24, ty, FB_W - 48, th, selAns == i ? C_GOLD : ansColor(i));
+    drawString(40, ty + th / 2 - 8, q->answers[i].c_str(), selAns == i ? C_INK : C_TEXT, 2);
+}
+
+void puzzleRowRect(int i, int *ry, int *rh) {
+    QuizQ *q = &qs[qi];
+    int h = (FB_H - 90 - playControlsY) / q->nAnswers;
+    if (h > 44) h = 44;
+    *ry = playControlsY + i * (h + 6);
+    *rh = h;
+}
+
+// Draw one puzzle row (tile + arrow), no blit.
+void drawPuzzleRowOnly(int i) {
+    QuizQ *q = &qs[qi];
+    int ry, rh;
+    puzzleRowRect(i, &ry, &rh);
+    tile(24, ry, FB_W - 110, rh, ansColor(i));
+    drawString(40, ry + rh / 2 - 8, q->answers[pOrder[i]].c_str(), C_TEXT, 2);
+    glassPanel(FB_W - 76, ry, 52, rh, true);
+    drawCenteredAt(FB_W - 50, ry + rh / 2 - 8, "^", C_TEXT, 2);
+}
+
+// Draw the slider value text + track, no blit.
+void drawSliderOnly(void) {
+    QuizQ *q = &qs[qi];
+    int y = playControlsY;
+    char txt[64];
+    snprintf(txt, 64, "%.1f    (%.1f - %.1f)", sVal, q->sMin, q->sMax);
+    drawBackgroundRect(24, y + 4, FB_W - 48, 26);
+    drawCentered(y + 8, txt, C_TEXT, 2);
+    glassPanel(60, y + 50, FB_W - 120, 46, false);
+    float t = (sVal - q->sMin) / (q->sMax - q->sMin);
+    fillRect(60, y + 50, (FB_W - 120) * t, 46, C_GOLD);
+}
+
 // Answer controls only (everything from playControlsY down). Callers
 // blitRect the same region.
 void drawPlayControls(void) {
     QuizQ *q = &qs[qi];
     int y = playControlsY;
-    int avail = FB_H - 90 - y;
     if (q->qtype == 0) {
-        int bh = avail / q->nAnswers;
-        if (bh > 68) bh = 68;
-        int totalH = q->nAnswers * bh + (q->nAnswers - 1) * 8;
-        int ay = y + (avail - totalH) / 2;
-        if (ay < y) ay = y;
-        for (int i = 0; i < q->nAnswers; i++) {
-            int by = ay + i * (bh + 8);
-            tile(24, by, FB_W - 48, bh, selAns == i ? C_GOLD : ansColor(i));
-            drawString(40, by + bh / 2 - 8, q->answers[i].c_str(), selAns == i ? C_INK : C_TEXT, 2);
-        }
+        for (int i = 0; i < q->nAnswers; i++) drawMcTileOnly(i);
         tile(24, FB_H - 76, FB_W - 48, 60, C_GOOD);
         drawCenteredShadow(FB_H - 50, "Submit", C_INK, 2);
     } else if (q->qtype == 1) {
@@ -912,24 +980,11 @@ void drawPlayControls(void) {
         tile(24, y + 162, FB_W - 48, 60, C_GOOD);
         drawCenteredShadow(y + 178, "Submit", C_INK, 2);
     } else if (q->qtype == 2) {
-        char txt[64];
-        snprintf(txt, 64, "%.1f    (%.1f - %.1f)", sVal, q->sMin, q->sMax);
-        drawCentered(y + 8, txt, C_TEXT, 2);
-        glassPanel(60, y + 50, FB_W - 120, 46, false);
-        float t = (sVal - q->sMin) / (q->sMax - q->sMin);
-        fillRect(60, y + 50, (FB_W - 120) * t, 46, C_GOLD);
+        drawSliderOnly();
         tile(24, FB_H - 76, FB_W - 48, 60, C_GOOD);
         drawCenteredShadow(FB_H - 50, "Submit", C_INK, 2);
     } else if (q->qtype == 3) {
-        int rh = (FB_H - 90 - y) / q->nAnswers;
-        if (rh > 44) rh = 44;
-        for (int i = 0; i < q->nAnswers; i++) {
-            int ry = y + i * (rh + 6);
-            tile(24, ry, FB_W - 110, rh, ansColor(i));
-            drawString(40, ry + rh / 2 - 8, q->answers[pOrder[i]].c_str(), C_TEXT, 2);
-            glassPanel(FB_W - 76, ry, 52, rh, true);
-            drawCenteredAt(FB_W - 50, ry + rh / 2 - 8, "^", C_TEXT, 2);
-        }
+        for (int i = 0; i < q->nAnswers; i++) drawPuzzleRowOnly(i);
         tile(24, FB_H - 76, FB_W - 48, 60, C_GOOD);
         drawCenteredShadow(FB_H - 50, "Submit", C_INK, 2);
     }
@@ -978,17 +1033,24 @@ void playLoop(void) {
             continue;
         }
         int y = playControlsY;
-        bool dirty = false;
         if (q->qtype == 0) {
-            int avail = FB_H - 90 - y;
-            int bh = avail / q->nAnswers;
-            if (bh > 68) bh = 68;
-            int totalH = q->nAnswers * bh + (q->nAnswers - 1) * 8;
-            int ay = y + (avail - totalH) / 2;
-            if (ay < y) ay = y;
             for (int i = 0; i < q->nAnswers; i++) {
-                int by = ay + i * (bh + 8);
-                if (tapIn(24, by, FB_W - 48, bh)) { selAns = i; dirty = true; }
+                int ty, th;
+                mcTileRect(i, &ty, &th);
+                if (tapIn(24, ty, FB_W - 48, th) && selAns != i) {
+                    // Repaint only the two tiles that change (old gold
+                    // one + newly tapped one) - tiny repaints, no tearing.
+                    int oldSel = selAns;
+                    selAns = i;
+                    if (oldSel >= 0) {
+                        int oy, oh;
+                        mcTileRect(oldSel, &oy, &oh);
+                        drawMcTileOnly(oldSel);
+                        blitRect(24, oy, FB_W - 48, oh);
+                    }
+                    drawMcTileOnly(i);
+                    blitRect(24, ty, FB_W - 48, th);
+                }
             }
         } else if (q->qtype == 1) {
             // The keyboard overwrites the whole screen, so it needs a full
@@ -999,25 +1061,26 @@ void playLoop(void) {
             if (tpActive && tpX >= 60 && tpX <= FB_W - 60 && tpY >= y + 50 && tpY <= y + 96) {
                 float t = (float)(tpX - 60) / (FB_W - 120);
                 sVal = q->sMin + t * (q->sMax - q->sMin);
-                dirty = true;
+                // Repaint just the value text strip + slider track.
+                drawSliderOnly();
+                blitRect(24, y + 4, FB_W - 48, 92);
             }
             if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
         } else if (q->qtype == 3) {
-            int rh = (FB_H - 90 - y) / q->nAnswers;
-            if (rh > 44) rh = 44;
             for (int i = 1; i < q->nAnswers; i++) {
-                int ry = y + i * (rh + 6);
+                int ry, rh;
+                puzzleRowRect(i, &ry, &rh);
                 if (tapIn(FB_W - 76, ry, 52, rh)) {
                     int t = pOrder[i]; pOrder[i] = pOrder[i - 1]; pOrder[i - 1] = t;
-                    dirty = true;
+                    // Repaint only the two rows that swapped.
+                    int ry0, rh0;
+                    puzzleRowRect(i - 1, &ry0, &rh0);
+                    drawPuzzleRowOnly(i - 1);
+                    drawPuzzleRowOnly(i);
+                    blitRect(24, ry0, FB_W - 48, rh0 + 6 + rh);
                 }
             }
             if (tapIn(24, FB_H - 76, FB_W - 48, 60)) submit();
-        }
-        // Only the answer controls changed: redraw just that region.
-        if (dirty) {
-            drawPlayControls();
-            blitRect(0, y, FB_W, FB_H - y);
         }
         delay(10);
     }
