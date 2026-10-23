@@ -150,6 +150,11 @@ void drawCenteredShadow(int y, const char *s, uint16_t color, int scale) {
     drawCentered(y, s, color, scale);
 }
 
+// Centres text around a specific x (for labels inside buttons/keys).
+void drawCenteredAt(int cx, int y, const char *s, uint16_t color, int scale) {
+    drawString(cx - textW(s, scale) / 2, y, s, color, scale);
+}
+
 // Wraps text into lines (simple word wrap). Returns line count.
 int wrapText(const char *s, int maxw, int scale, String *lines, int maxLines) {
     int n = 0;
@@ -187,7 +192,7 @@ bool backHit(int x, int y, int w, int h) {
 }
 void drawBack(void) {
     tile(12, 12, 120, 44, C_INK);
-    drawCentered(24, "Back", C_TEXT, 2);
+    drawCenteredAt(12 + 60, 24, "Back", C_TEXT, 2);
 }
 
 // ------------------------------------------------------------------ touch
@@ -286,7 +291,7 @@ HttpResp http_req(const char *method, const String &path, const String &formData
     c.print(path);
     c.print(" HTTP/1.1\r\nHost: ");
     c.print(SERVER_HOST);
-    c.print("\r\nConnection: close\r\n");
+    c.print("\r\nUser-Agent: QuizFabric3DS-ESP32\r\nConnection: close\r\n");
     if (formData.length()) {
         c.print("Content-Type: application/x-www-form-urlencoded\r\n");
         c.print("Content-Length: ");
@@ -347,32 +352,40 @@ String keyboard(const char *hint, const char *initial) {
     static const char *rows[3] = { "qwertyuiop", "asdfghjkl", "zxcvbnm1234567890" };
     String out = initial ? initial : "";
     bool shift = false;
+    int baseY = 132;
+    int cy = baseY + 3 * 72 + 12;
+    String lastOut = "\x01";   // force first paint
+    bool lastShift = !shift;
     while (true) {
-        drawBackground();
-        glassPanel(20, 16, FB_W - 40, 96, false);
-        drawCentered(30, hint, C_FAINT, 1);
-        drawCentered(62, out.c_str(), C_TEXT, 2);
+        // Redraw only when something changed (single-buffered: a full
+        // redraw+blit every frame flickers).
+        if (out != lastOut || shift != lastShift) {
+            lastOut = out;
+            lastShift = shift;
+            drawBackground();
+            glassPanel(20, 16, FB_W - 40, 96, false);
+            drawCentered(30, hint, C_FAINT, 1);
+            drawCentered(62, out.c_str(), C_TEXT, 2);
 
-        int baseY = 132;
-        for (int r = 0; r < 3; r++) {
-            const char *row = rows[r];
-            int n = strlen(row);
-            int kw = (FB_W - 60) / n;
-            for (int i = 0; i < n; i++) {
-                int x = 30 + i * kw;
-                char ch = row[i];
-                if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
-                tile(x, baseY + r * 72, kw - 8, 64, ansColor(r));
-                char b[2] = { ch, 0 };
-                drawCentered(baseY + r * 72 + 20, b, C_TEXT, 2);
+            for (int r = 0; r < 3; r++) {
+                const char *row = rows[r];
+                int n = strlen(row);
+                int kw = (FB_W - 60) / n;
+                for (int i = 0; i < n; i++) {
+                    int x = 30 + i * kw;
+                    char ch = row[i];
+                    if (shift && ch >= 'a' && ch <= 'z') ch = toupper(ch);
+                    tile(x, baseY + r * 72, kw - 8, 64, ansColor(r));
+                    char b[2] = { ch, 0 };
+                    drawCenteredAt(x + (kw - 8) / 2, baseY + r * 72 + 20, b, C_TEXT, 2);
+                }
             }
+            tile(30, cy, 230, 64, C_GLASS);       drawCenteredAt(30 + 115, cy + 20, "SPACE", C_TEXT, 2);
+            tile(280, cy, 200, 64, C_GLASS_HI);    drawCenteredAt(280 + 100, cy + 20, shift ? "ABC" : "SHIFT", C_INK, 2);
+            tile(500, cy, 200, 64, C_BAD);         drawCenteredAt(500 + 100, cy + 20, "DEL", C_TEXT, 2);
+            tile(720, cy, 274, 64, C_GOOD);        drawCenteredAt(720 + 137, cy + 20, "DONE", C_INK, 2);
+            blit();
         }
-        int cy = baseY + 3 * 72 + 12;
-        tile(30, cy, 230, 64, C_GLASS);       drawCentered(cy + 20, "SPACE", C_TEXT, 2);
-        tile(280, cy, 200, 64, C_GLASS_HI);    drawCentered(cy + 20, shift ? "ABC" : "SHIFT", C_INK, 2);
-        tile(500, cy, 200, 64, C_BAD);         drawCentered(cy + 20, "DEL", C_TEXT, 2);
-        tile(720, cy, 274, 64, C_GOOD);        drawCentered(cy + 20, "DONE", C_INK, 2);
-        blit();
 
         touch_step();
         if (tapIn(30, cy, 230, 64)) out += ' ';
@@ -492,7 +505,7 @@ void drawList(void) {
             drawSprite(22, rowY + 4, thumbSpr[i], thumbW[i], thumbH[i]);
         } else {
             fillRect(22, rowY + 4, 48, 48, C_INK);
-            drawCentered(rowY + 18, "?", C_TEXT, 2);
+            drawCenteredAt(22 + 24, rowY + 18, "?", C_TEXT, 2);
         }
         drawString(90, rowY + 16, quizNames[qi].c_str(), C_TEXT, 2);
     }
@@ -753,7 +766,7 @@ void drawPlay(void) {
             tile(24, ry, FB_W - 110, rh, ansColor(i));
             drawString(40, ry + rh / 2 - 8, q->answers[pOrder[i]].c_str(), C_TEXT, 2);
             glassPanel(FB_W - 76, ry, 52, rh, true);
-            drawCentered(ry + rh / 2 - 8, "^", C_TEXT, 2);
+            drawCenteredAt(FB_W - 50, ry + rh / 2 - 8, "^", C_TEXT, 2);
         }
         tile(24, FB_H - 76, FB_W - 48, 60, C_GOOD);
         drawCenteredShadow(FB_H - 50, "Submit", C_INK, 2);
@@ -879,7 +892,8 @@ void drawSteal(void) {
     glassPanel(16, 66, FB_W - 230, 60, false);
     drawString(28, 82, stealSearch.c_str(), C_TEXT, 2);
     tile(FB_W - 200, 66, 184, 60, ansColor(0));
-    drawCenteredShadow(82, "Search", C_INK, 2);
+    drawCenteredAt(FB_W - 108, 84, "Search", C_INK, 2);
+    drawCenteredAt(FB_W - 108, 82, "Search", C_INK, 2);
     drawCentered(150, "Tap a result to steal it", C_FAINT, 1);
     for (int i = 0; i < nResults && i < 7; i++) {
         int ry = 176 + i * 58;
@@ -891,7 +905,7 @@ void drawSteal(void) {
             drawSprite(22, ry + 3, sCovSpr[i], sCovW[i], sCovH[i]);
         } else {
             fillRect(22, ry + 3, 46, 46, C_INK);
-            drawCentered(ry + 18, "?", C_TEXT, 2);
+            drawCenteredAt(22 + 23, ry + 18, "?", C_TEXT, 2);
         }
         drawString(86, ry + 16, sTitle[i].c_str(), C_TEXT, 2);
     }
